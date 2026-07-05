@@ -1,0 +1,19 @@
+{
+  "name": "lin-agent",
+  "version": "0.1.0",
+  "description": "Minimal-viable Agent runtime built from scratch (no agent framework).",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "start:v2": "tsx src/index-v2.ts",
+    "dev": "tsx watch src/index.ts",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}
