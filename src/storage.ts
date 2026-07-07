@@ -78,3 +78,9 @@ export function memoryDir(): string {
   mkdirSync(dir, { recursive: true });
   return dir;
 }
+
+export function skillsDir(): string {
+  const dir = join(linagentHome().path, 'skills');
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}

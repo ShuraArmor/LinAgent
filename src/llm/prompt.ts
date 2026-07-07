@@ -1,11 +1,13 @@
 import type { ToolRegistry } from '../tools/registry.ts';
 
-export function buildSystemPrompt(registry: ToolRegistry): string {
+export function buildSystemPrompt(registry: ToolRegistry, skillList?: string, mcpResources?: string): string {
+  const skillSection = skillList ? `\n\n${skillList}` : '';
+  const mcpSection = mcpResources ? `\n\n${mcpResources}` : '';
   return `你是 LinAgent，一个稳健的、会用工具的助手。
 
 你可以调用以下工具。每次调用都必须严格匹配工具的 JSON 参数 schema。
 
-${registry.describeAll()}
+${registry.describeAll()}${skillSection}${mcpSection}
 
 每一轮你必须只输出一个 JSON 对象（对象外不要有任何多余文本，也不要用代码围栏），结构如下：
 

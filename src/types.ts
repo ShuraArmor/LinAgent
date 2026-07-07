@@ -34,12 +34,25 @@ export interface MemoryHandle {
   forget(id: string): { ok: boolean; forgotten?: string; error?: string };
 }
 
+export interface SkillHandle {
+  /** 读某个 skill 的完整正文；未知 skill 抛错。 */
+  load(name: string): { name: string; description: string; body: string; script?: { filename: string; filepath: string; content: string; runtime: string } };
+  /** 列出所有可用 skill 的名字。 */
+  names(): string[];
+  /** 列出所有可用 skill 的名字和描述（不读正文）。 */
+  list(): Array<{ name: string; description: string }>;
+  /** 创建/覆盖一个 skill，写到磁盘并注册进内存。 */
+  create(name: string, description: string, body: string, opts?: { script?: string; scriptFilename?: string; runtime?: string }): { ok: boolean; error?: string };
+}
+
 export interface ToolContext {
   sessionId: string;
   sessionState: Record<string, unknown>;
   logger: (msg: string) => void;
   /** 可选 —— 仅当 agent 配置了 MemoryStore 时才有值。 */
   memory?: MemoryHandle;
+  /** 可选 —— 仅当 agent 配置了 SkillRegistry 时才有值。 */
+  skills?: SkillHandle;
 }
 
 export interface Tool {

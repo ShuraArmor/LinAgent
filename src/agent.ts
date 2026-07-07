@@ -1,6 +1,8 @@
-import type { LLMClient, Message, MemoryHandle, TraceEntry } from './types.ts';
+import type { LLMClient, Message, MemoryHandle, SkillHandle, TraceEntry } from './types.ts';
 import type { Session } from './session.ts';
 import type { ToolRegistry } from './tools/registry.ts';
+import type { SkillRegistry } from './skills.ts';
+import { loadSkillTool, listSkillsTool, createSkillTool } from './tools/skill.ts';
 import { ToolNotFoundError, ToolValidationError, ToolExecutionError } from './tools/registry.ts';
 import { parseAgentOutput } from './llm/parser.ts';
 import { buildSystemPrompt } from './llm/prompt.ts';
@@ -44,6 +46,8 @@ export interface AgentConfig {
    * 未设置时，`requireApproval` 里的工具会被默认拒绝（fail-closed）。
    */
   approve?: (req: ApprovalRequest) => Promise<ApprovalDecision>;
+  /** MCP 资源描述段，拼进 system prompt。由 MCPManager.describeResources() 生成。 */
+  mcpResources?: string;
 }
 
 export const DEFAULT_AGENT_CONFIG: AgentConfig = {
@@ -106,7 +110,33 @@ export class Agent {
     private readonly registry: ToolRegistry,
     private readonly config: AgentConfig = DEFAULT_AGENT_CONFIG,
     private readonly memory?: MemoryConfig,
-  ) {}
+    private readonly skills?: SkillRegistry,
+  ) {
+    // 配了 skill 注册表 → 注册 skill 相关工具（幂等：已注册就跳过）。
+    // create_skill 和 list_skills 即使当前没有 skill 也要注册（agent 需要能创建第一个）。
+    // load_skill 只在有 skill 时才有意义。
+    if (this.skills) {
+      if (!this.registry.has('list_skills')) this.registry.register(listSkillsTool);
+      if (!this.registry.has('create_skill')) this.registry.register(createSkillTool);
+      if (this.skills.list().length > 0 && !this.registry.has('load_skill')) {
+        this.registry.register(loadSkillTool);
+      }
+    }
+  }
+
+  private skillHandle(): SkillHandle | undefined {
+    if (!this.skills) return undefined;
+    const skills = this.skills;
+    return {
+      load: (name) => {
+        const s = skills.load(name);
+        return { name: s.name, description: s.description, body: s.body, script: s.script };
+      },
+      names: () => skills.list().map((s) => s.name),
+      list: () => skills.list().map((s) => ({ name: s.name, description: s.description })),
+      create: (name, description, body, opts) => skills.create(name, description, body, opts),
+    };
+  }
 
   async chat(
     session: Session,
@@ -137,7 +167,9 @@ export class Agent {
 
     // 跨会话记忆：为本次输入检索相关 fact，拼进 system prompt。
     // identity / preferences 每次都注入；facts / ongoing 按关键词命中，见 retrieveForQuery。
-    const systemPromptBase = buildSystemPrompt(this.registry);
+    // skill 清单（只有 name+description）也拼进 system prompt，正文靠 load_skill 惰性加载。
+    const skillList = this.skills?.describeForPrompt() || undefined;
+    const systemPromptBase = buildSystemPrompt(this.registry, skillList, this.config.mcpResources);
     let memoryPrompt = '';
     let userMem: UserMemory | undefined;
     if (this.memory) {
@@ -253,6 +285,7 @@ export class Agent {
             memory: this.memory
               ? makeMemoryHandle(this.memory.store, this.memory.userId, session.id)
               : undefined,
+            skills: this.skillHandle(),
           });
           toolContent = JSON.stringify({ ok: true, result });
           push('tool_result', { name: call.name, result }, turn);

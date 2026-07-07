@@ -1,11 +1,12 @@
 import * as readline from 'node:readline';
-import { linagentHome, sessionsDir, memoryDir } from './storage.ts';
+import { linagentHome, sessionsDir, memoryDir, skillsDir } from './storage.ts';
 import { Agent, DEFAULT_AGENT_CONFIG } from './agent.ts';
 import { SessionManager, FileSessionStore } from './session.ts';
 import { buildDefaultRegistry } from './tools/index.ts';
 import { buildLLMFromEnv } from './llm/client.ts';
 import { loadDotEnv } from './util/dotenv.ts';
 import { FileMemoryStore, retrieveForQuery, formatForPrompt } from './memory.ts';
+import { SkillRegistry } from './skills.ts';
 import { c, hr, symbols } from './ui/ansi.ts';
 import {
   banner, userLine, thoughtLine,
@@ -22,6 +23,7 @@ import type { ApprovalDecision, ApprovalRequest } from './agent.ts';
 import { breakdown as tokenBreakdown, contextWindow } from './tokens.ts';
 import { tokenLine, tokenBarChart } from './ui/tokens.ts';
 import { buildSystemPrompt } from './llm/prompt.ts';
+import { MCPManager, loadMCPConfig, buildMCPResourceTool, buildMCPPromptTool } from './mcp/index.ts';
 
 async function main() {
   loadDotEnv();
@@ -56,7 +58,7 @@ async function main() {
 
   let current = sessions.list()[0] ?? sessions.create('window-1');
   console.log(c.gray(`当前会话: ${c.cyan(current.id)} (${current.title})`));
-  console.log(c.dim(`命令: /new [标题] · /list · /switch <id> · /rm <id> · /memory [list|forget <id>|clear] · /tokens · /trace · /reset · /nostream · /help · /exit`));
+  console.log(c.dim(`命令: /new [标题] · /list · /switch <id> · /rm <id> · /memory · /skill · /mcp · /tokens · /trace · /reset · /nostream · /help · /exit`));
   console.log(hr(), '\n');
 
   // 跨会话记忆 —— <LinAgent home>/memory/ 下每个用户一个文件
@@ -69,6 +71,26 @@ async function main() {
   // 若要限制作用域，取消下一行注释：
   // setSandboxRoot(process.cwd());
   void setSandboxRoot;
+
+  // ─── MCP 服务器 ──────────────────────────────────────────────────────────
+  let mcpManager: MCPManager | undefined;
+  let mcpResourcesDesc = '';
+  const mcpConfig = loadMCPConfig();
+  if (mcpConfig.size > 0) {
+    mcpManager = new MCPManager();
+    const { tools: mcpTools, resources: mcpResources, prompts: mcpPrompts, errors } = await mcpManager.startAll(mcpConfig);
+    for (const tool of mcpTools) registry.register(tool);
+    if (mcpResources.size > 0) registry.register(buildMCPResourceTool(mcpManager));
+    if (mcpPrompts.size > 0) registry.register(buildMCPPromptTool(mcpManager));
+    mcpResourcesDesc = mcpManager.describeResources();
+    console.log(c.gray(`MCP: ${mcpTools.length} 工具, ${[...mcpResources.values()].flat().length} 资源, ${[...mcpPrompts.values()].flat().length} prompts  (${mcpConfig.size} 台服务器)`));
+    for (const { server, error } of errors) {
+      console.log(c.red(`  ${symbols.cross} ${server}: ${error}`));
+    }
+  }
+
+  // ─── Skill 注册表 ─────────────────────────────────────────────────────────
+  const skillRegistry = new SkillRegistry(skillsDir());
 
   // 一根永不熄的心跳，保证进程始终有活跃 handle。
   // 即使 stdin / readline 因为 raw-mode 切换出现瞬时空档，事件循环也不会
@@ -109,10 +131,11 @@ async function main() {
     ...DEFAULT_AGENT_CONFIG,
     requireApproval: new Set(RISKY_TOOLS),
     approve,
+    mcpResources: mcpResourcesDesc || undefined,
   }, {
     store: memStore,
     userId,
-  });
+  }, skillRegistry);
 
   // 每轮的流式渲染
   const rl = readline.createInterface({
@@ -158,7 +181,7 @@ async function main() {
           rl.close();
           return;
         case 'help':
-          console.log(c.gray('命令: /new [标题] · /list · /switch <id> · /rm <id> · /memory [list|forget <id>|clear] · /tokens · /trace · /reset · /nostream · /exit'));
+          console.log(c.gray('命令: /new [标题] · /list · /switch <id> · /rm <id> · /memory [list|forget <id>|clear] · /skill [list|show <name>] · /mcp · /tokens · /trace · /reset · /nostream · /exit'));
           break;
         case 'new': {
           current = sessions.create(rest.join(' ') || undefined);
@@ -264,6 +287,45 @@ async function main() {
           console.log(tokenBarChart(tokenBreakdown(current.history, extras), contextWindow()));
           break;
         }
+        case 'skill':
+        case 'skills': {
+          const sub = rest[0];
+          const skills = skillRegistry.list();
+          if (!sub || sub === 'list') {
+            if (!skills.length) { console.log(c.gray('(暂无可用 skill)')); break; }
+            for (const s of skills) {
+              console.log(`  ${c.cyan(s.name)}  ${c.gray(s.description)}`);
+            }
+            console.log(c.dim(`\n共 ${skills.length} 个 skill。用 /skill show <name> 查看完整正文。`));
+          } else if (sub === 'show' || sub === 'load') {
+            const name = rest[1];
+            if (!name) { console.log(c.red('用法: /skill show <name>')); break; }
+            try {
+              const loaded = skillRegistry.load(name);
+              console.log(`${c.cyan(c.bold(loaded.name))}  ${c.gray(loaded.description)}\n`);
+              console.log(loaded.body);
+            } catch (err) {
+              console.log(c.red((err as Error).message));
+            }
+          } else {
+            console.log(c.red('用法: /skill [list|show <name>]'));
+          }
+          break;
+        }
+        case 'mcp': {
+          if (!mcpManager || mcpManager.listServers().length === 0) {
+            console.log(c.gray('(未连接任何 MCP 服务器)'));
+            break;
+          }
+          for (const s of mcpManager.status()) {
+            console.log(`  ${c.cyan(s.name)}  ${c.gray(`${s.tools} 工具, ${s.resources} 资源, ${s.prompts} prompts`)}`);
+            const tools = mcpManager.getServerTools(s.name);
+            for (const t of tools) {
+              console.log(`    ${c.dim('·')} ${t.name}  ${c.gray(t.description.replace(/^\[MCP:\w+\]\s*/, ''))}`);
+            }
+          }
+          break;
+        }
         default:
           console.log(c.red(`未知命令: /${cmd}`));
       }
@@ -362,9 +424,10 @@ async function main() {
     rl.prompt();
   });
 
-  rl.on('close', () => {
+  rl.on('close', async () => {
     clearInterval(heartbeat);
     clearInterval(keepAlive);
+    if (mcpManager) await mcpManager.shutdown();
     console.log(c.gray('\n再见。'));
     process.exit(0);
   });

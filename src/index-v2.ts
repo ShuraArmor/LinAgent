@@ -27,6 +27,7 @@ import { plannerSystemPrompt } from './v2/planner.ts';
 import type { Plan } from './v2/plan.ts';
 import type { ExecSpan } from './v2/executor.ts';
 import { mkdirSync } from 'node:fs';
+import { MCPManager, loadMCPConfig, buildMCPResourceTool, buildMCPPromptTool } from './mcp/index.ts';
 
 type V2Decision = 'approve' | 'approve_session' | 'deny';
 
@@ -45,6 +46,22 @@ async function main() {
   }
 
   const registry = buildDefaultRegistry();
+
+  // ─── MCP ───
+  let mcpManager: MCPManager | undefined;
+  const mcpConfig = loadMCPConfig();
+  if (mcpConfig.size > 0) {
+    mcpManager = new MCPManager();
+    const { tools: mcpTools, resources: mcpResources, prompts: mcpPrompts, errors } = await mcpManager.startAll(mcpConfig);
+    for (const tool of mcpTools) registry.register(tool);
+    if (mcpResources.size > 0) registry.register(buildMCPResourceTool(mcpManager));
+    if (mcpPrompts.size > 0) registry.register(buildMCPPromptTool(mcpManager));
+    console.log(c.gray(`MCP: ${mcpTools.length} 工具, ${[...mcpResources.values()].flat().length} 资源  (${mcpConfig.size} 台服务器)`));
+    for (const { server, error } of errors) {
+      console.log(c.red(`  ${symbols.cross} ${server}: ${error}`));
+    }
+  }
+
   // v2 session 独占目录，避免和 v1 会话文件混
   const home = linagentHome();
   const sessDir = join(home.path, 'sessions-v2');
@@ -241,7 +258,8 @@ async function main() {
     rl.prompt();
   });
 
-  rl.on('close', () => {
+  rl.on('close', async () => {
+    if (mcpManager) await mcpManager.shutdown();
     console.log(c.gray('bye.'));
     process.exit(0);
   });
