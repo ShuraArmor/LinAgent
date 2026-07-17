@@ -13,7 +13,7 @@ const cfg = {
 };
 
 test('agent: direct answer without a tool call', async () => {
-  const llm = new MockLLM([finalAnswer('hello there', 'no tool needed')]);
+  const llm = new MockLLM([finalAnswer('hello there')]);
   const agent = new Agent(llm, buildDefaultRegistry(), cfg);
   const mgr = new SessionManager();
   const s = mgr.create();
@@ -26,7 +26,7 @@ test('agent: direct answer without a tool call', async () => {
 test('agent: single tool loop → calculator → final', async () => {
   const llm = new MockLLM([
     toolCall('calculator', { expression: '(3+4)*2' }, 'need math'),
-    finalAnswer('14', 'done'),
+    finalAnswer('14'),
   ]);
   const agent = new Agent(llm, buildDefaultRegistry(), cfg);
   const mgr = new SessionManager();
@@ -77,19 +77,10 @@ test('agent: tool validation error is fed back and the loop recovers', async () 
   assert.ok(err, 'expected a tool error in trace');
 });
 
-test('agent: unparsable output is followed up with a corrective user turn', async () => {
-  const llm = new MockLLM([
-    'not-json at all',
-    finalAnswer('recovered'),
-  ]);
-  const agent = new Agent(llm, buildDefaultRegistry(), cfg);
-  const mgr = new SessionManager();
-  const s = mgr.create();
-  const res = await agent.chat(s, 'go');
-  assert.equal(res.finalAnswer, 'recovered');
-  const errParse = res.trace.find((t) => t.kind === 'error' && (t.data as { where: string }).where === 'parse');
-  assert.ok(errParse);
-});
+// 注：原来的"unparsable output 自修"测试已删除 —— 原生工具调用协议下，
+// 模型输出由 provider 的约束解码保证结构合法，不再有"抠 JSON 失败 → 回喂 user 让它自修"
+// 这条路径（parser.ts 已删）。工具参数不合 schema 的情况由 validation error 作为
+// tool result 回传处理，见上一条测试。
 
 test('agent: enforces maxTurns', async () => {
   const llm = new MockLLM();

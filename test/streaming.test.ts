@@ -8,8 +8,8 @@ import { MockLLM, toolCall, finalAnswer } from './mock-llm.ts';
 const cfg = { ...DEFAULT_AGENT_CONFIG, maxTurns: 4, useLLMCompression: false };
 
 test('streaming: onDelta receives chunks that reassemble to the full LLM output', async () => {
-  const answer = finalAnswer('this is a longer answer to force multiple chunks');
-  const llm = new MockLLM([answer]);
+  const answerText = 'this is a longer answer to force multiple chunks';
+  const llm = new MockLLM([finalAnswer(answerText)]);
   const agent = new Agent(llm, buildDefaultRegistry(), cfg);
   const mgr = new SessionManager();
   const s = mgr.create();
@@ -19,7 +19,7 @@ test('streaming: onDelta receives chunks that reassemble to the full LLM output'
     onDelta: (chunk) => { chunks.push(chunk); },
   });
   assert.ok(chunks.length > 1, 'expected multiple chunks');
-  assert.equal(chunks.join(''), answer);
+  assert.equal(chunks.join(''), answerText);
   assert.match(res.finalAnswer, /longer answer/);
 });
 

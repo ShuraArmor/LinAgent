@@ -1,7 +1,33 @@
-node_modules
+# 依赖
+node_modules/
+
+# 密钥 / 本地环境
 .env
 .env.local
+.env.*.local
+
+# 构建产物
+dist/
+*.tsbuildinfo
+
+# SEA 打包临时文件
+sea-prep.blob
+sea-config.json
+
+# 日志
 *.log
-dist
-.tsx-cache
-.linagent
+
+# 缓存
+.tsx-cache/
+
+# 本地会话 / 记忆数据（项目本地 .linagent/ 覆盖模式产生，不入库）
+.linagent/
+
+# 个人笔记 / 内部文档（不随仓库分发）
+docs/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

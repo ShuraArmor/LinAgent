@@ -47,14 +47,8 @@ export function linagentHome(cwd: string = process.cwd()): { path: string; sourc
     return { path: p, source: 'env' };
   }
 
-  // 2) 项目本地 .linagent/ 已存在 → 就地用
-  const local = resolve(cwd, '.linagent');
-  if (existsSync(local)) {
-    cachedRoot = local; cachedSource = 'cwd';
-    return { path: local, source: 'cwd' };
-  }
-
-  // 3) 落到 OS 用户缓存目录
+  // 2) 落到 OS 用户缓存目录（Windows: %LOCALAPPDATA%\LinAgent）。
+  //    不再读项目本地 .linagent/ —— 配置/会话统一放用户目录，不污染项目目录。
   const p = join(osUserCacheDir(), 'LinAgent');
   mkdirSync(p, { recursive: true });
   cachedRoot = p; cachedSource = 'os';
@@ -81,6 +75,18 @@ export function memoryDir(): string {
 
 export function skillsDir(): string {
   const dir = join(linagentHome().path, 'skills');
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+export function ledgersDir(): string {
+  const dir = join(linagentHome().path, 'ledgers');
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+export function tasksDir(): string {
+  const dir = join(linagentHome().path, 'tasks');
   mkdirSync(dir, { recursive: true });
   return dir;
 }

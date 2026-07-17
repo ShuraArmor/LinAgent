@@ -16,6 +16,13 @@ export interface ProviderPreset {
   apiKeyEnv?: string;
   /** 简短说明；报错和 --help 里会显示。 */
   description?: string;
+  /**
+   * 是否支持 response_format:{type:"json_schema"}。
+   * 只有官方 OpenAI 稳定支持；DeepSeek/Moonshot/智谱/Groq 等只支持 json_object
+   * （对 json_schema 直接 400）。不支持时 complete() 降级到 json_object + prompt 描述。
+   * 默认 false（保守）。
+   */
+  supportsJsonSchema?: boolean;
 }
 
 export const PROVIDERS: Record<string, ProviderPreset> = {
@@ -25,6 +32,7 @@ export const PROVIDERS: Record<string, ProviderPreset> = {
     defaultModel: 'gpt-4o-mini',
     apiKeyEnv: 'OPENAI_API_KEY',
     description: 'OpenAI 官方 API',
+    supportsJsonSchema: true,
   },
   anthropic: {
     protocol: 'anthropic',

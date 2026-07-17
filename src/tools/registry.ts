@@ -1,4 +1,4 @@
-import type { JSONSchema, JSONSchemaProp, Tool, ToolContext } from '../types.ts';
+import type { JSONSchema, JSONSchemaProp, Tool, ToolContext, ToolSpec } from '../types.ts';
 
 export class ToolValidationError extends Error {}
 export class ToolNotFoundError extends Error {}
@@ -87,14 +87,35 @@ export class ToolRegistry {
     return Array.from(this.tools.values());
   }
 
-  /** 拼进 LLM system prompt 的紧凑工具清单。 */
-  describeAll(): string {
-    return this.list()
-      .map((t) => {
-        const schema = JSON.stringify(t.parameters);
-        return `- ${t.name}: ${t.description}\n  schema: ${schema}`;
-      })
-      .join('\n');
+  /** 转成 provider 无关的 ToolSpec 列表（client 层再转各家格式）。 */
+  toSpecs(): ToolSpec[] {
+    return this.list().map((t) => ({
+      name: t.name,
+      description: t.description,
+      parameters: t.parameters,
+    }));
+  }
+
+  /** OpenAI / OpenAI 兼容 provider 的 tools 格式。 */
+  toOpenAITools(): Array<{
+    type: 'function';
+    function: { name: string; description: string; parameters: JSONSchema };
+  }> {
+    return this.list().map((t) => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: t.parameters },
+    }));
+  }
+
+  /** Anthropic Messages API 的 tools 格式（注意是 input_schema 不是 parameters）。 */
+  toAnthropicTools(): Array<{
+    name: string; description: string; input_schema: JSONSchema;
+  }> {
+    return this.list().map((t) => ({
+      name: t.name,
+      description: t.description,
+      input_schema: t.parameters,
+    }));
   }
 
   async invoke(

@@ -55,6 +55,28 @@ test('bash_exec: 超时会 kill 进程并标记 timed_out', async () => {
   assert.ok(r.signal !== null || (r.exit_code !== null && r.exit_code !== 0));
 });
 
+test('bash_exec: 孙子进程占住管道 close 不触发时，超时仍强制结算（不无限卡死）', { timeout: 15_000 }, async () => {
+  // 复现用户 bug：cmd /c 启动 GUI（electron）后 shell 退出，但 GUI 继承并占住
+  // stdout/stderr 管道 → 'close' 永不触发。旧代码只在 close 时 resolve → 永久卡住。
+  // 这里用 node 派生一个 detached、继承 stdio 的孙子进程，父进程立刻退出来模拟：
+  // 孙子存活并占着管道，shell 的读端拿不到 EOF，'close' 不会来。
+  const script = [
+    "const {spawn}=require('child_process');",
+    "const g=spawn(process.execPath,['-e','setTimeout(()=>{},30000)'],{stdio:'inherit',detached:true});",
+    "g.unref();",
+    "process.exit(0);",
+  ].join('');
+  const t0 = Date.now();
+  const r = await call(bashExecTool, {
+    command: `node -e "${script}"`,
+    timeout_ms: 800,
+  }) as R;
+  const elapsed = Date.now() - t0;
+  // 关键断言：必须在 timeout + grace + 余量 内结算，而不是等满 30s（旧代码会卡死）
+  assert.ok(elapsed < 5000, `应在超时后很快强制结算，实际耗时 ${elapsed}ms`);
+  assert.equal(r.timed_out, true);
+});
+
 test('bash_exec: stdout 超上限会截断并置 truncated=true', async () => {
   const script = `let s='x'.repeat(1024);for(let i=0;i<400;i++) process.stdout.write(s);`;
   const r = await call(bashExecTool, {

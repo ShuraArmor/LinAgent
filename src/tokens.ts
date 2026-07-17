@@ -28,7 +28,8 @@ export function categorize(m: Message): MsgCategory {
   if (m.role === 'assistant') return 'assistant';
   if (m.role === 'tool') return 'tool_result';
   if (m.role === 'system') {
-    if (m.content.startsWith('早期对话摘要')) return 'summary';
+    // 压缩摘要：新格式「【已压缩 @segN …】」+ 旧 FIFO 摘要「早期对话摘要」。
+    if (m.content.startsWith('【已压缩') || m.content.startsWith('早期对话摘要')) return 'summary';
     if (m.content.startsWith('关于本用户的已知信息')) return 'memory_facts';
   }
   return 'system';
@@ -57,9 +58,26 @@ export function estimateTokensOfText(s: string): number {
   return Math.max(1, t);
 }
 
-/** 估算一条消息的 token 数（含结构开销）。 */
+/**
+ * 估算一条消息的 token 数（含结构开销）。
+ * 关键：不能只数 content —— 工具调用的 args、DeepSeek 的 reasoning、Anthropic 的原始
+ * content blocks 在线格式里都真实发送/占位，漏算会导致压缩触发严重偏晚 → context 400。
+ */
 export function estimateTokensOfMessage(m: Message): number {
-  return estimateTokensOfText(m.content) + MESSAGE_OVERHEAD;
+  let t = estimateTokensOfText(m.content) + MESSAGE_OVERHEAD;
+  // 工具调用参数：OpenAI 线格式里 function.arguments = JSON.stringify(args)，真实发送。
+  if (m.toolCalls?.length) {
+    for (const tc of m.toolCalls) {
+      t += estimateTokensOfText(tc.name) + estimateTokensOfText(JSON.stringify(tc.args));
+    }
+  }
+  // thinking：DeepSeek reasoning 是字符串；Anthropic 原始 blocks（含 thinking + tool_use input）
+  // 会随 providerRaw 原样回传。两者都占真实 token。
+  if (m.thinking?.raw != null) {
+    const raw = m.thinking.raw;
+    t += estimateTokensOfText(typeof raw === 'string' ? raw : JSON.stringify(raw));
+  }
+  return t;
 }
 
 /** 类别 → token 数。 */

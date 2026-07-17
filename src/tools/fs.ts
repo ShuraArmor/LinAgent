@@ -78,26 +78,56 @@ async function resolvePath(input: string): Promise<{ absolute: string; rel: stri
 export const fsReadTool: Tool = {
   name: 'fs_read',
   description:
-    '读取某个文本文件的内容（UTF-8）。默认可访问整个文件系统，' +
-    '仅在调用方主动设置了沙盒时才受限。单文件上限 512KB，超过会拒绝。',
+    '读取某个文本文件的内容（UTF-8）。默认可访问整个文件系统，仅在调用方设置了沙盒时才受限。' +
+    '大文件不会报错：默认最多返回前 512KB，可用 offset/limit 按行读取指定片段。',
   parameters: {
     type: 'object',
     properties: {
       path: { type: 'string', description: '文件路径，绝对或相对（相对路径基于沙盒根或 cwd）。' },
-      max_bytes: { type: 'integer', description: '可选：本次最多读多少字节（不超过 512KB）。' },
+      offset: { type: 'integer', description: '可选：从第几行开始读（1-based）。配合 limit 读大文件的某一段。' },
+      limit: { type: 'integer', description: '可选：最多读多少行（从 offset 起）。' },
+      max_bytes: { type: 'integer', description: '可选：本次最多返回多少字节（默认 512KB，超出部分截断而非报错）。' },
     },
     required: ['path'],
     additionalProperties: false,
   },
   async handler(args) {
     const path = args.path as string;
-    const cap = Math.min(MAX_BYTES, (args.max_bytes as number | undefined) ?? MAX_BYTES);
+    // max_bytes 是"最多返回这么多字节"（截断上限），不是"文件超过就拒绝"。封顶 512KB。
+    const rawMax = args.max_bytes as number | undefined;
+    const cap = Math.min(MAX_BYTES, rawMax != null && rawMax > 0 ? rawMax : MAX_BYTES);
+    const offset = args.offset as number | undefined;   // 1-based 起始行
+    const limit = args.limit as number | undefined;      // 读多少行
     const { absolute, rel } = await resolvePath(path);
     const st = await fs.stat(absolute);
     if (!st.isFile()) throw new Error(`不是文件: ${rel}`);
-    if (st.size > cap) throw new Error(`文件大小 ${st.size}B 超过上限 ${cap}B`);
-    const text = await fs.readFile(absolute, 'utf8');
-    return { path: rel, bytes: st.size, content: text };
+
+    let text = await fs.readFile(absolute, 'utf8');
+    let slicedByLine = false;
+    // 行切片：offset/limit 任一给了就按行切（大文件读局部的正道，模型常用）。
+    if (offset != null || limit != null) {
+      const lines = text.split('\n');
+      const start = Math.max(0, (offset ?? 1) - 1);        // offset 1-based → 0-based
+      const end = limit != null ? start + Math.max(0, limit) : lines.length;
+      text = lines.slice(start, end).join('\n');
+      slicedByLine = true;
+    }
+
+    // 字节上限：超出只截断、不报错（这是"最多读这么多"，不是"太大就拒绝"）。
+    let truncatedBytes = false;
+    if (Buffer.byteLength(text, 'utf8') > cap) {
+      text = Buffer.from(text, 'utf8').subarray(0, cap).toString('utf8');
+      truncatedBytes = true;
+    }
+
+    return {
+      path: rel,
+      file_bytes: st.size,
+      returned_bytes: Buffer.byteLength(text, 'utf8'),
+      ...(slicedByLine ? { sliced_by_line: true, offset: offset ?? 1, limit } : {}),
+      ...(truncatedBytes ? { truncated: true, note: `内容超过 ${cap}B 已截断；用 offset/limit 分段读或调大 max_bytes` } : {}),
+      content: text,
+    };
   },
 };
 

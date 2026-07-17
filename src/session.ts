@@ -80,7 +80,11 @@ export class SessionManager {
 
   create(title?: string): Session {
     this.counter += 1;
-    const id = `s${this.counter}-${Math.random().toString(36).slice(2, 6)}`;
+    // 格式：s<counter>-<base36时间戳>-<12位随机>。保留 s<counter>- 前缀（构造函数靠它恢复
+    // counter），后半段够长够唯一，避免旧的 4 位随机后缀碰撞。
+    const ts = Date.now().toString(36);
+    const rand = Array.from({ length: 12 }, () => Math.floor(Math.random() * 36).toString(36)).join('');
+    const id = `s${this.counter}-${ts}-${rand}`;
     const s: Session = {
       id,
       title: title ?? `window-${this.counter}`,

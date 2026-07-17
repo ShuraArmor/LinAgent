@@ -20,7 +20,7 @@ export {
 export { bashExecTool } from './bash.ts';
 
 /** 需要审批的高影响工具名单；由 Agent 的 approval gate 参考。 */
-export const RISKY_TOOLS = new Set<string>(['fs_write', 'fs_delete', 'bash_exec']);
+export const RISKY_TOOLS = new Set<string>(['fs_write', 'fs_delete', 'bash_exec', 'run_workflow']);
 
 export function buildDefaultRegistry(): ToolRegistry {
   const reg = new ToolRegistry();

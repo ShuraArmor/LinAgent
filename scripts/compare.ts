@@ -1,6 +1,8 @@
 /**
- * 用同一个真实 LLM，让 v1（循环）和 v2（planner/executor 分离）跑同一个请求，
- * 打印 LLM 调用次数、wall-clock、trace 长度，方便对比。
+ * 用同一个真实 LLM、同一个 Agent，分别在 loop 模式和 plan 模式下跑同一请求，
+ * 打印 LLM 调用次数、wall-clock、trace 长度，方便对比两种决策模式的开销。
+ *
+ * 只有一个 Agent + planMode 开关：loop 模式（边想边做）vs plan 模式（先规划再执行）。
  *
  *   npx tsx scripts/compare.ts "帮我查一下北京的天气，然后把'带伞'加进待办"
  */
@@ -8,62 +10,63 @@ import { loadDotEnv } from '../src/util/dotenv.ts';
 import { buildLLMFromEnv } from '../src/llm/client.ts';
 import { buildDefaultRegistry } from '../src/tools/index.ts';
 import { SessionManager } from '../src/session.ts';
-import { Agent as V1Agent, DEFAULT_AGENT_CONFIG } from '../src/agent.ts';
-import { V2Agent } from '../src/v2/agent.ts';
+import { Agent, DEFAULT_AGENT_CONFIG } from '../src/agent.ts';
+import type { LLMClient } from '../src/types.ts';
+
+/** 包一层，统计 chat（loop 决策）+ complete（planner/synth）两条路径的调用总数。 */
+function counting(llm: LLMClient): { llm: LLMClient; count: () => number } {
+  let n = 0;
+  const wrapped: LLMClient = {
+    name: llm.name,
+    chat: (req) => { n++; return llm.chat(req); },
+    complete: llm.complete ? (msgs, opts) => { n++; return llm.complete!(msgs, opts); } : undefined,
+  };
+  return { llm: wrapped, count: () => n };
+}
+
+async function run(mode: 'loop' | 'plan', base: LLMClient, userMsg: string) {
+  const { llm, count } = counting(base);
+  const reg = buildDefaultRegistry();
+  const session = new SessionManager().create(mode);
+  if (mode === 'plan') session.state.planMode = true;
+  const agent = new Agent(llm, reg, { ...DEFAULT_AGENT_CONFIG, useLLMCompression: false });
+  const t = Date.now();
+  const res = await agent.chat(session, userMsg);
+  return { res, calls: count(), elapsed: Date.now() - t };
+}
 
 async function main() {
   loadDotEnv();
-  const llm = buildLLMFromEnv();
-  const reg = buildDefaultRegistry();
+  const base = buildLLMFromEnv();
   const userMsg = process.argv.slice(2).join(' ') ||
     "帮我查一下北京的天气，然后把'带伞'加进待办";
 
   console.log(`\n=== 用户请求 ===\n${userMsg}\n`);
 
-  // v1：包一下 .chat 好统计调用次数
-  let v1Calls = 0;
-  const v1Llm = {
-    name: llm.name,
-    chat: async (msgs: Parameters<typeof llm.chat>[0], opts?: Parameters<typeof llm.chat>[1]) => {
-      v1Calls++;
-      return llm.chat(msgs, opts);
-    },
-  };
-  const v1Mgr = new SessionManager();
-  const v1Session = v1Mgr.create('v1');
-  const v1Agent = new V1Agent(v1Llm as typeof llm, reg, { ...DEFAULT_AGENT_CONFIG, useLLMCompression: false });
-  const t1 = Date.now();
-  const v1Res = await v1Agent.chat(v1Session, userMsg);
-  const v1Elapsed = Date.now() - t1;
+  const loop = await run('loop', base, userMsg);
+  const plan = await run('plan', base, userMsg);
 
-  // v2：指标是内建的
-  const v2Mgr = new SessionManager();
-  const v2Session = v2Mgr.create('v2');
-  const v2Agent = new V2Agent(llm, reg);
-  const t2 = Date.now();
-  const v2Res = await v2Agent.chat(v2Session, userMsg);
-  const v2Elapsed = Date.now() - t2;
-
-  console.log(`─── v1（while 循环） ─────────────────────────────`);
-  console.log(`回答:        ${v1Res.finalAnswer}`);
-  console.log(`LLM 调用:    ${v1Calls}`);
-  console.log(`轮次:        ${v1Res.turns}`);
-  console.log(`trace 步数:  ${v1Res.trace.length}`);
-  console.log(`耗时:        ${v1Elapsed}ms`);
+  console.log(`─── loop 模式（ReAct 边想边做） ──────────────────`);
+  console.log(`回答:        ${loop.res.finalAnswer}`);
+  console.log(`LLM 调用:    ${loop.calls}`);
+  console.log(`轮次:        ${loop.res.turns}`);
+  console.log(`trace 步数:  ${loop.res.trace.length}`);
+  console.log(`耗时:        ${loop.elapsed}ms`);
   console.log();
-  console.log(`─── v2（planner/executor） ───────────────────────`);
-  console.log(`回答:            ${v2Res.answer}`);
-  console.log(`LLM 调用:        ${v2Res.metrics.llm_calls}`);
-  console.log(`  planner:       ${v2Res.metrics.planner_calls}`);
-  console.log(`  reflector:     ${v2Res.metrics.reflector_calls}`);
-  console.log(`  synthesize:    ${v2Res.metrics.synth_calls}`);
-  console.log(`span 数:         ${v2Res.spans.length}`);
-  console.log(`耗时:            ${v2Elapsed}ms`);
+  console.log(`─── plan 模式（先规划再执行） ────────────────────`);
+  console.log(`回答:            ${plan.res.finalAnswer}`);
+  console.log(`LLM 调用:        ${plan.calls}`);
+  if (plan.res.planMetrics) {
+    console.log(`  planner:       ${plan.res.planMetrics.planner_calls}`);
+    console.log(`  reflector:     ${plan.res.planMetrics.reflector_calls}`);
+  }
+  console.log(`span 数:         ${plan.res.spans?.length ?? 0}`);
+  console.log(`耗时:            ${plan.elapsed}ms`);
   console.log();
   console.log(`─── 差值 ─────────────────────────────────────`);
-  console.log(`LLM 调用:  v1=${v1Calls}  v2=${v2Res.metrics.llm_calls}  ` +
-    `(减少 ${v1Calls > 0 ? Math.round(((v1Calls - v2Res.metrics.llm_calls) / v1Calls) * 100) : 0}%)`);
-  console.log(`Wall-clock: v1=${v1Elapsed}ms  v2=${v2Elapsed}ms`);
+  const pct = loop.calls > 0 ? Math.round(((loop.calls - plan.calls) / loop.calls) * 100) : 0;
+  console.log(`LLM 调用:  loop=${loop.calls}  plan=${plan.calls}  (plan 相对 ${pct >= 0 ? '减少' : '增加'} ${Math.abs(pct)}%)`);
+  console.log(`Wall-clock: loop=${loop.elapsed}ms  plan=${plan.elapsed}ms`);
 }
 
 main().catch((err) => {

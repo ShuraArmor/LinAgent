@@ -1,11 +1,13 @@
 import { c, hr, symbols } from './ansi.ts';
 import type { TraceEntry, ToolCall } from '../types.ts';
 import { displayWidth, padEndCols, wrapCols, stripAnsi } from './width.ts';
+import { renderLogo, logoTagline } from './logo.ts';
 
 export function banner(providerName: string, tools: string[]): string {
-  const title = c.bold(c.cyan('LinAgent'));
+  const logo = renderLogo();
+  const tagline = logoTagline();
   const sub = c.gray(`provider=${providerName}  工具=[${tools.join(', ')}]`);
-  return `\n${title}  ${c.dim('最小可用 agent runtime')}\n${sub}\n${hr()}\n`;
+  return `\n${logo}\n\n${tagline}\n${sub}\n${hr()}\n`;
 }
 
 export function userLine(text: string): string {
@@ -26,6 +28,28 @@ export function toolResultLine(name: string, ok: boolean, preview: string): stri
   const icon = ok ? c.green(symbols.check) : c.red(symbols.cross);
   const head = c.green(`${symbols.arrow}${symbols.arrow} ${name}`);
   return `  ${icon} ${head} ${c.gray(preview)}`;
+}
+
+/**
+ * 把一条 `tool_result` trace 的 data 安全渲染成 { name, preview }。
+ * 两种来源、两种形状：
+ *   - 普通工具：{ name, result }
+ *   - 后台任务完成通知（drainCompleted）：{ backgroundTask, status }（没有 name/result）
+ * 关键坑：`JSON.stringify(undefined)` 返回的是值 `undefined`（不是字符串），
+ * 直接 `.slice()` 会抛 "Cannot read properties of undefined (reading 'slice')"。
+ * 所以这里对 result 缺失/序列化为 undefined 的情况兜底，绝不让渲染把整轮打挂。
+ */
+export function toolResultPreview(
+  data: { name?: string; result?: unknown; backgroundTask?: string; status?: string },
+  max = 120,
+): { name: string; preview: string } {
+  if (data.backgroundTask) {
+    return { name: `后台任务 ${data.backgroundTask}`, preview: `状态: ${data.status ?? '未知'}` };
+  }
+  const name = data.name ?? '(unknown)';
+  const json = JSON.stringify(data.result);
+  const preview = json === undefined ? '(无返回值)' : json.slice(0, max);
+  return { name, preview };
 }
 
 /**
@@ -57,7 +81,28 @@ export function errorLine(where: string, msg: string): string {
   return `${c.red(symbols.cross + ' 错误')} ${c.gray(`[${where}]`)} ${msg}`;
 }
 
-export function compressLine(folded: number, kept: number): string {
+/**
+ * 压缩事件有两种 trace 形状，来自两条不同的压缩路径：
+ *   - FIFO 摘要路径：       { folded, kept }
+ *   - 账本归档路径(archive)：{ archived, beforeTokens, afterTokens, savedPct }
+ * 之前只按 FIFO 形状取 folded/kept，账本路径命中就渲染成 "折叠 undefined 条"。
+ * 这里按实际字段判别，缺字段也兜底成数字，绝不显示 undefined。
+ */
+export function compressLine(data: {
+  folded?: number; kept?: number;
+  archived?: number; beforeTokens?: number; afterTokens?: number; savedPct?: number;
+}): string {
+  // 账本归档路径：有 token 数或 archived 字段。
+  if (data.beforeTokens !== undefined || data.afterTokens !== undefined || data.archived !== undefined) {
+    const archived = data.archived ?? 0;
+    const before = data.beforeTokens ?? 0;
+    const after = data.afterTokens ?? 0;
+    const pct = data.savedPct ?? 0;
+    return c.gray(`${symbols.gear} 已压缩：归档 ${archived} 条 → tokens ${before}→${after}（省 ${pct}%）`);
+  }
+  // FIFO 摘要路径。
+  const folded = data.folded ?? 0;
+  const kept = data.kept ?? 0;
   return c.gray(`${symbols.gear} 已压缩：折叠 ${folded} 条 → 摘要 + 保留最近 ${kept} 条`);
 }
 

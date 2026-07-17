@@ -34,6 +34,34 @@ test('fs_read: 读取沙盒内的文件', async () => {
   } finally { cleanup(dir); }
 });
 
+test('fs_read: offset/limit 按行读片段（模型常用的读局部方式）', async () => {
+  const dir = mkSandbox();
+  try {
+    const lines = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`).join('\n');
+    writeFileSync(join(dir, 'many.txt'), lines, 'utf8');
+    const out = await call(fsReadTool, { path: 'many.txt', offset: 40, limit: 3 }) as {
+      content: string; sliced_by_line?: boolean;
+    };
+    assert.equal(out.sliced_by_line, true);
+    assert.equal(out.content, 'line 40\nline 41\nline 42', '应精确返回第 40-42 行');
+  } finally { cleanup(dir); }
+});
+
+test('fs_read: 大文件不报错，超 max_bytes 只截断（回归"20B 超上限"误报）', async () => {
+  const dir = mkSandbox();
+  try {
+    writeFileSync(join(dir, 'big.txt'), 'X'.repeat(12074), 'utf8');  // 复现那条 12074B 文件
+    // 关键：max_bytes=20 表示"最多返回 20 字节"，绝不能因"文件 12074B > 20"就报错。
+    const out = await call(fsReadTool, { path: 'big.txt', max_bytes: 20 }) as {
+      content: string; truncated?: boolean; file_bytes: number; returned_bytes: number;
+    };
+    assert.equal(out.truncated, true, '应标记截断');
+    assert.equal(out.file_bytes, 12074, '原文件大小如实报告');
+    assert.ok(out.returned_bytes <= 20, `返回不超过 20 字节，实际 ${out.returned_bytes}`);
+    assert.equal(out.content, 'X'.repeat(20));
+  } finally { cleanup(dir); }
+});
+
 test('fs_read: 拒绝沙盒外的相对路径', async () => {
   const dir = mkSandbox();
   try {

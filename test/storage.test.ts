@@ -30,7 +30,9 @@ test('storage: LINAGENT_HOME 优先级最高', () => {
   } finally { rmSync(dir, { recursive: true, force: true }); resetLinagentHomeCache(); }
 });
 
-test('storage: 项目本地 .linagent/ 存在时优先本地', () => {
+test('storage: 项目本地 .linagent/ 不再被优先 —— 统一落 OS 用户目录', () => {
+  // 存储策略：只认 env（LINAGENT_HOME）→ 否则一律用 OS 用户缓存目录。
+  // 项目本地 .linagent/ 即使存在也不再作为存储根（不污染项目目录）。
   const cwd = mkdtempSync(join(tmpdir(), 'linagent-cwd-'));
   const local = join(cwd, '.linagent');
   mkdirSync(local);
@@ -38,8 +40,9 @@ test('storage: 项目本地 .linagent/ 存在时优先本地', () => {
     resetLinagentHomeCache();
     withEnv({ LINAGENT_HOME: undefined }, () => {
       const home = linagentHome(cwd);
-      assert.equal(home.source, 'cwd');
-      assert.equal(home.path, local);
+      assert.equal(home.source, 'os', '有项目本地 .linagent 也应落到 OS 目录');
+      assert.notEqual(home.path, local, '不应把项目本地 .linagent 当存储根');
+      assert.match(home.path, /LinAgent$/);
     });
   } finally { rmSync(cwd, { recursive: true, force: true }); resetLinagentHomeCache(); }
 });

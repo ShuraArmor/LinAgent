@@ -4,16 +4,28 @@
   "description": "Minimal-viable Agent runtime built from scratch (no agent framework).",
   "private": true,
   "type": "module",
+  "bin": {
+    "linagent": "src/index.tsx"
+  },
   "scripts": {
-    "start": "tsx src/index.ts",
-    "start:v2": "tsx src/index-v2.ts",
-    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.tsx",
+    "dev": "tsx watch src/index.tsx",
     "test": "tsx --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build-exe.mjs",
+    "build:bundle": "esbuild src/index.tsx --bundle --platform=node --target=node20 --format=cjs --outfile=dist/bundle.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "@types/react": "^18.3.31",
+    "esbuild": "^0.28.1",
+    "postject": "^1.0.0-alpha.6",
     "tsx": "^4.7.0",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "ink": "^5.2.1",
+    "react": "^18.3.1"
   }
 }

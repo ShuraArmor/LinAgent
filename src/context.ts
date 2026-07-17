@@ -47,7 +47,7 @@ export async function llmSummarize(llm: LLMClient, messages: Message[]): Promise
     { role: 'user', content: transcript },
   ];
   try {
-    const out = await llm.chat(prompt, { temperature: 0 });
+    const out = await llm.complete(prompt, { temperature: 0 });
     return `早期对话摘要：\n${out.trim()}`;
   } catch {
     return heuristicSummarize(messages);

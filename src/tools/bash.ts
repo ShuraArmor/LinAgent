@@ -88,18 +88,42 @@ function runShell(command: string, cwdAbs: string, timeoutMs: number, extraEnv: 
     child.stderr?.on('data', (b) => append('stderr', b));
 
     let timedOut = false;
+    let settled = false;
     let killTimer: NodeJS.Timeout | null = null;
+    let forceSettle: NodeJS.Timeout | null = null;
+
+    // 只结算一次 —— 超时强制结算和正常 close 会竞争，谁先到算谁。
+    const settle = (r: BashResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(graceKill);
+      if (killTimer) clearTimeout(killTimer);
+      if (forceSettle) clearTimeout(forceSettle);
+      res(r);
+    };
 
     const graceKill = setTimeout(() => {
       timedOut = true;
-      try { child.kill('SIGTERM'); } catch { /* noop */ }
-      killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* noop */ } }, GRACE_MS);
+      killTree(child);
+      // 关键：GUI / 常驻进程（如 electron）会继承并占住 stdout/stderr 管道，
+      // 'close' 永远不触发。所以超时后即便 close 没来，也要强制结算，
+      // 否则整个工具调用（乃至 REPL）无限卡死。见 kill 后再等 GRACE_MS 兜底。
+      forceSettle = setTimeout(() => {
+        settle({
+          command, cwd: cwdAbs,
+          exit_code: null, signal: 'SIGKILL',
+          stdout: stdoutBuf,
+          stderr: (stderrBuf + `\n[timeout] 命令超过 ${timeoutMs}ms 未结束，已强制结束进程树。` +
+            `若这是 GUI/常驻服务，请用 spawn_task 放后台，或用 detached 方式启动（见工具说明）。`).trim(),
+          duration_ms: Date.now() - started,
+          timed_out: true,
+          truncated: { stdout: stdoutTruncated, stderr: stderrTruncated },
+        });
+      }, GRACE_MS);
     }, timeoutMs);
 
     child.on('error', (err) => {
-      clearTimeout(graceKill);
-      if (killTimer) clearTimeout(killTimer);
-      res({
+      settle({
         command, cwd: cwdAbs,
         exit_code: null, signal: null,
         stdout: stdoutBuf,
@@ -111,9 +135,7 @@ function runShell(command: string, cwdAbs: string, timeoutMs: number, extraEnv: 
     });
 
     child.on('close', (code, signal) => {
-      clearTimeout(graceKill);
-      if (killTimer) clearTimeout(killTimer);
-      res({
+      settle({
         command, cwd: cwdAbs,
         exit_code: typeof code === 'number' ? code : null,
         signal: typeof signal === 'string' ? signal : null,
@@ -127,13 +149,36 @@ function runShell(command: string, cwdAbs: string, timeoutMs: number, extraEnv: 
   });
 }
 
+/**
+ * 结束子进程"整棵树"。
+ * Windows：child.kill 只发给 cmd.exe，而 cmd /c 往往已退出，孙子进程（electron 等）
+ *   收不到信号 → 用 taskkill /T /F 按 PID 连整棵树一起杀。
+ * POSIX：SIGTERM 给进程；shell:true 下由 shell 转发给子进程。
+ */
+function killTree(child: ReturnType<typeof spawn>): void {
+  if (process.platform === 'win32' && child.pid) {
+    try {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+    } catch { /* noop */ }
+    return;
+  }
+  try { child.kill('SIGTERM'); } catch { /* noop */ }
+  setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* noop */ } }, GRACE_MS);
+}
+
 export const bashExecTool: Tool = {
   name: 'bash_exec',
   description:
     '在系统 shell 里执行一段命令，返回 exit_code、stdout、stderr。' +
     'Windows 走 cmd.exe /c，POSIX 走 /bin/sh -c。' +
     '默认 30s 超时（可覆盖，最长 5 分钟），stdout/stderr 各上限 256KB（超过会截断）。' +
-    '此工具为高影响动作，每次调用都需要用户审批。',
+    '此工具为高影响动作，每次调用都需要用户审批。' +
+    '\n⚠️ 重要：这是**前台阻塞**执行，会一直等到命令结束。' +
+    '对于不会自己退出的命令——GUI 应用（electron、浏览器）、长期运行的服务器（dev server、后端进程）、' +
+    'watch 模式等——**不要直接在这里跑**，否则会一直卡住直到超时被强杀。正确做法二选一：' +
+    '\n  1) 用 spawn_task 把它丢到后台（推荐，能拿到任务句柄、完成后回报）；' +
+    '\n  2) 若只是要"启动后不管"，用分离方式让命令立刻返回：' +
+    'Windows 用 `start "" 你的命令`，POSIX 用 `nohup 你的命令 >/dev/null 2>&1 &`。',
   parameters: {
     type: 'object',
     properties: {

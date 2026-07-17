@@ -1,10 +1,9 @@
-import type { LLMClient, Message, MemoryHandle, SkillHandle, TraceEntry } from './types.ts';
+import type { LLMClient, Message, MemoryHandle, SkillHandle, LedgerHandle, TraceEntry } from './types.ts';
 import type { Session } from './session.ts';
 import type { ToolRegistry } from './tools/registry.ts';
 import type { SkillRegistry } from './skills.ts';
 import { loadSkillTool, listSkillsTool, createSkillTool } from './tools/skill.ts';
 import { ToolNotFoundError, ToolValidationError, ToolExecutionError } from './tools/registry.ts';
-import { parseAgentOutput } from './llm/parser.ts';
 import { buildSystemPrompt } from './llm/prompt.ts';
 import {
   compressIfNeeded,
@@ -15,12 +14,53 @@ import {
 } from './context.ts';
 import type { MemoryStore, UserMemory } from './memory.ts';
 import {
-  addManual, forget, mergeCandidates, retrieveForQuery, formatForPrompt,
+  addManual, forget, retrieveForQuery, formatForPrompt,
 } from './memory.ts';
-import { extractFacts } from './extractor.ts';
+import type {
+  LedgerStore, LedgerPatch, ArchiveStore, CompressionTriggerConfig, Preset,
+} from './ledger/index.ts';
+import {
+  applyPatches,
+  buildLedgerInstruction,
+  renderLedgerForPrompt,
+  renderPresetFewShot,
+  tryCompress,
+  compressTraceData,
+  buildTriggerConfig,
+  consolidateLedgerToMemory,
+  pickPreset,
+  updateLedgerTool,
+} from './ledger/index.ts';
+import type { Ledger } from './ledger/index.ts';
+import type { BackgroundTaskManager } from './tasks/manager.ts';
+import { taskTools } from './tools/tasks.ts';
+// plan 模式：复用 plan 引擎纯函数（planner / verifier / executor / reflector）作为
+// 同一个 ReAct agent 的一个决策模式。这些函数只吃 llm/registry/session，天然可嵌入。
+import { plan as callPlanner, reflect as callReflector, applyPatch, PlannerError } from './plan/planner.ts';
+import { verifyPlan, PlanVerifyError } from './plan/verifier.ts';
+import { executePlan } from './plan/executor.ts';
+import type { Plan } from './plan/plan.ts';
+import type { ExecSpan } from './plan/executor.ts';
 
 /** 工具审批的返回值。 */
 export type ApprovalDecision = 'approve' | 'approve_session' | 'deny';
+
+/**
+ * 手动压缩（compressNow）的结果 —— 在通用压缩报告基础上，额外带上账本条目数。
+ * ledgerItems===0 表示这轮没维护账本：压缩只归档了原文，上下文里没有结构化摘要留存。
+ */
+export type ManualCompressResult = import('./ledger/index.ts').CompressTraceData & {
+  ledgerItems: number;
+};
+
+/** plan 模式的指标（与 loop 模式的 turns 并列，只在 plan 模式填充）。 */
+export interface PlanMetrics {
+  planner_calls: number;
+  reflector_calls: number;
+  verify_attempts: number;
+  execute_attempts: number;
+  elapsed_ms: number;
+}
 
 export interface ApprovalRequest {
   toolName: string;
@@ -48,6 +88,10 @@ export interface AgentConfig {
   approve?: (req: ApprovalRequest) => Promise<ApprovalDecision>;
   /** MCP 资源描述段，拼进 system prompt。由 MCPManager.describeResources() 生成。 */
   mcpResources?: string;
+  /** plan 模式：reflector 修补失败 plan 的最大次数。默认 2。 */
+  planReflections?: number;
+  /** plan 模式：planner 输出未通过校验时的最大重试次数。默认 2。 */
+  planVerifyRetries?: number;
 }
 
 export const DEFAULT_AGENT_CONFIG: AgentConfig = {
@@ -59,6 +103,23 @@ export const DEFAULT_AGENT_CONFIG: AgentConfig = {
   useLLMCompression: true,
 };
 
+/** chat / resumeForTasks 的回调集（per-call，比 config.onTrace 优先级高）。 */
+export interface ChatHooks {
+  onDelta?: (chunk: string, turn: number) => void;
+  onReasoningDelta?: (chunk: string, turn: number) => void;
+  onTurnStart?: (turn: number) => void;
+  onTrace?: (entry: TraceEntry) => void;
+  /** plan 模式：每个执行 span 开始/结束时回调（REPL 用来画 span 流）。 */
+  onSpan?: (span: ExecSpan) => void;
+  /** plan 模式：planner/reflector 的流式增量。 */
+  onPlanDelta?: (chunk: string, phase: 'planner' | 'reflector') => void;
+  /**
+   * 用户打断信号。aborted 时：在途 LLM 请求立即断流，agent 循环在下一个检查点收尾退出，
+   * 已流式产出的部分正常保留。由 REPL 的 Esc 键触发。
+   */
+  signal?: AbortSignal;
+}
+
 export interface RunResult {
   finalAnswer: string;
   turns: number;
@@ -69,15 +130,49 @@ export interface RunResult {
    */
   systemPromptBase: string;   // 工具描述 + 角色约束
   memoryPrompt: string;        // 跨会话记忆注入段（空串代表没注入）
+  /** 账本相关段：指令 + 当前账本渲染（若启用了账本）。 */
+  ledgerPrompt?: string;
+  /** plan 模式产出：本轮的 Plan（loop 模式为 undefined）。 */
+  plan?: Plan;
+  /** plan 模式产出：执行 span 流（loop 模式为 undefined）。 */
+  spans?: ExecSpan[];
+  /** plan 模式产出：规划/执行指标（loop 模式为 undefined）。 */
+  planMetrics?: PlanMetrics;
 }
 
 export interface MemoryConfig {
   store: MemoryStore;
   userId: string;
-  /** 按关键词命中注入的 facts / ongoing 条数上限，默认 5。 */
-  topK?: number;
-  /** 是否跳过每轮结束后的自动抽取（memory 工具仍可用）。默认 false。 */
+  /**
+   * 是否跳过会话闭合时的账本→记忆自动巩固（consolidate）。默认 false。
+   * memory 工具（用户显式 add/forget）和 recall_memory（召回）不受它影响。
+   */
   disableIngest?: boolean;
+}
+
+/**
+ * 会话账本配置。见 src/ledger/ 子系统。
+ * 提供 store 就启用账本；每轮 chat 会加载账本、注入 prompt、应用 LLM 提交的 patch。
+ */
+export interface LedgerConfig {
+  store: LedgerStore;
+  /**
+   * 会话账本用哪种语言解释指令段（"zh" / "en"）。当前只 "zh" 有 prompt 实现，
+   * 传别的默认按 "zh" 处理。
+   */
+  language?: string;
+  /**
+   * 归档 store —— 用于账本驱动的压缩。传了就启用新压缩机制（旧的 context.ts
+   * 走的 FIFO 摘要不再触发）；不传时压缩仍走旧路径。
+   */
+  archive?: ArchiveStore;
+  /** 压缩触发条件；不传时用 buildTriggerConfig() 生成默认。 */
+  trigger?: Partial<CompressionTriggerConfig>;
+  /**
+   * 可选：候选 preset 集合。不传就用 BUILTIN_PRESETS（4 份内置）。
+   * 用户想加自己的 preset 就在 REPL 那层 mergePresets(userPresets) 传进来。
+   */
+  presets?: Preset[];
 }
 
 function makeMemoryHandle(store: MemoryStore, userId: string, sessionId: string): MemoryHandle {
@@ -105,12 +200,42 @@ function makeMemoryHandle(store: MemoryStore, userId: string, sessionId: string)
 }
 
 export class Agent {
+  /**
+   * "本会话都允许"的放行名单 —— **进程内存**，按 sessionId 存，不落盘。
+   * 安全考量：放行只在本次进程运行期间有效；重启后重新询问，避免用户几天前
+   * 点过"允许"、下次打开这个会话危险工具就被静默执行。
+   */
+  private sessionApprovals = new Map<string, Set<string>>();
+
+  /**
+   * 会话级冻结的 system prompt —— 进程内存，按 "sessionId|planMode" 存。
+   * 首轮构建一次（基座 + identity/preferences 快照 + 账本指令 + preset few-shot），之后整会话复用。
+   * 这是保住 provider 前缀缓存的核心：system 消息一字不变，缓存前缀才不作废。
+   * 用 planMode 入 key —— 切 plan/loop 会换基座描述，自然重新冻结；/new 换 sessionId 也自然失效。
+   */
+  private frozenSystemPrompt = new Map<string, string>();
+
+  /** 让某会话下次 chat 重新冻结 system prompt（/reset 后调 —— 记忆/账本可能已变）。 */
+  invalidateFrozenPrompt(sessionId: string): void {
+    for (const key of [...this.frozenSystemPrompt.keys()]) {
+      if (key.startsWith(`${sessionId}|`)) this.frozenSystemPrompt.delete(key);
+    }
+  }
+
+  private approvedSet(sessionId: string): Set<string> {
+    let s = this.sessionApprovals.get(sessionId);
+    if (!s) { s = new Set(); this.sessionApprovals.set(sessionId, s); }
+    return s;
+  }
+
   constructor(
     private readonly llm: LLMClient,
     private readonly registry: ToolRegistry,
     private readonly config: AgentConfig = DEFAULT_AGENT_CONFIG,
     private readonly memory?: MemoryConfig,
     private readonly skills?: SkillRegistry,
+    private readonly ledger?: LedgerConfig,
+    private readonly taskManager?: BackgroundTaskManager,
   ) {
     // 配了 skill 注册表 → 注册 skill 相关工具（幂等：已注册就跳过）。
     // create_skill 和 list_skills 即使当前没有 skill 也要注册（agent 需要能创建第一个）。
@@ -122,6 +247,26 @@ export class Agent {
         this.registry.register(loadSkillTool);
       }
     }
+    // 启用账本 → 注册 update_ledger 工具（agent 通过它维护账本）。
+    if (this.ledger && !this.registry.has('update_ledger')) {
+      this.registry.register(updateLedgerTool);
+    }
+    // 启用后台任务 → 注册任务工具集（spawn_task / check_task / list_tasks / cancel_task）。
+    if (this.taskManager) {
+      for (const t of taskTools) if (!this.registry.has(t.name)) this.registry.register(t);
+    }
+  }
+
+  /** 给工具用的后台任务 handle —— 转发到 BackgroundTaskManager，绑定当前 session。 */
+  private taskHandle(sessionId: string): import('./types.ts').TaskHandle | undefined {
+    if (!this.taskManager) return undefined;
+    const mgr = this.taskManager;
+    return {
+      spawn: (tool, args, label, graceMs) => mgr.spawn(sessionId, tool, args, label, graceMs),
+      check: (id) => mgr.check(id),
+      list: (status) => mgr.list(sessionId, status),
+      cancel: (id) => mgr.cancel(id),
+    };
   }
 
   private skillHandle(): SkillHandle | undefined {
@@ -138,18 +283,56 @@ export class Agent {
     };
   }
 
-  async chat(
+  /**
+   * 给 update_ledger 工具用的 handle —— 把 patch 应用到当前会话账本上。
+   * currentLedger 在 chat 里 load 一次、循环内共享；这里闭包捕获它。
+   */
+  private makeLedgerHandle(
+    ledger: Ledger,
+    turn: number,
+    push: (kind: TraceEntry['kind'], data: unknown, t: number) => void,
+  ): LedgerHandle {
+    return {
+      applyPatches: (patches) => {
+        const valid = (patches as LedgerPatch[]).filter((p) => !!p && typeof p === 'object');
+        const report = applyPatches(ledger, valid, turn);
+        ledger.turn_count = turn;
+        ledger.updated_at = Date.now();
+        push('ledger', {
+          phase: 'patched',
+          applied: report.applied.length,
+          failed: report.failed.length,
+          failures: report.failed.map((f) => f.error),
+        }, turn);
+        return report;
+      },
+    };
+  }
+
+  /**
+   * 正常对话轮：用户发一条消息，跑一轮决策。
+   */
+  async chat(session: Session, userInput: string, hooks?: ChatHooks): Promise<RunResult> {
+    return this.runTurn(session, userInput, hooks);
+  }
+
+  /**
+   * 唤醒轮：**不带用户消息**，只把已完成的后台任务结果注入历史后跑一轮。
+   * 由 REPL 在"某个后台任务/workflow 完成"时主动调用——让 agent 自己醒过来处理结果，
+   * 不用干等用户下次发言、也不用轮询。agent 自主决定要不要回复用户（见注入措辞）。
+   * 若此刻没有未投递的完成任务（drain 为空），直接返回一个 no-op 结果，不打扰 LLM。
+   */
+  async resumeForTasks(session: Session, hooks?: ChatHooks): Promise<RunResult> {
+    return this.runTurn(session, null, hooks);
+  }
+
+  /**
+   * 一轮的共用实现。userInput===null 表示唤醒轮（无用户消息）。
+   */
+  private async runTurn(
     session: Session,
-    userInput: string,
-    hooks?: {
-      onDelta?: (chunk: string, turn: number) => void;
-      onTurnStart?: (turn: number) => void;
-      /**
-       * 每产生一条 trace 都会回调一次。**per-call**，比 config.onTrace 优先级高。
-       * REPL 想每轮换 handler 时用这个 —— 不用动 config 单例。
-       */
-      onTrace?: (entry: TraceEntry) => void;
-    },
+    userInput: string | null,
+    hooks?: ChatHooks,
   ): Promise<RunResult> {
     const startTrace = session.trace.length;
     const push = (kind: TraceEntry['kind'], data: unknown, turn: number) => {
@@ -159,45 +342,131 @@ export class Agent {
       this.config.onTrace?.(entry);  // config-level handler 兜底
     };
 
-    session.history.push({ role: 'user', content: userInput });
-    push('user_input', { text: userInput }, 0);
-
-    // 先做一次压缩，让上下文跨会话保持在可控大小。
-    await this.maybeCompress(session, 0, push);
-
-    // 跨会话记忆：为本次输入检索相关 fact，拼进 system prompt。
-    // identity / preferences 每次都注入；facts / ongoing 按关键词命中，见 retrieveForQuery。
-    // skill 清单（只有 name+description）也拼进 system prompt，正文靠 load_skill 惰性加载。
-    const skillList = this.skills?.describeForPrompt() || undefined;
-    const systemPromptBase = buildSystemPrompt(this.registry, skillList, this.config.mcpResources);
-    let memoryPrompt = '';
-    let userMem: UserMemory | undefined;
-    if (this.memory) {
-      userMem = this.memory.store.load(this.memory.userId);
-      const relevant = retrieveForQuery(userMem, userInput, this.memory.topK ?? 5);
-      memoryPrompt = formatForPrompt(relevant);
-      push('memory', { retrieved: relevant.length, userId: this.memory.userId }, 0);
+    // 后台任务完成通知：把已完成（未投递）的后台任务结果，作为 system 消息注入本轮。
+    // drainCompleted 内部标记 delivered，不重复注入。措辞里给 agent 明确的行动指令，
+    // 落实"agent 自己判断"——需要则继续后续步骤/告知用户，否则静默处理。
+    let injectedCount = 0;
+    if (this.taskManager) {
+      const done = this.taskManager.drainCompleted(session.id);
+      for (const t of done) {
+        const body = t.status === 'done'
+          ? `结果：${truncateForInject(JSON.stringify(t.result))}`
+          : `失败：${t.error}`;
+        session.history.push({
+          role: 'system',
+          content:
+            `[后台任务 ${t.id}「${t.label}」已${t.status === 'done' ? '完成' : '失败'}] ${body}\n` +
+            `（这是你之前发起的后台任务的结果。请判断：需要据此继续后续步骤、或告知用户，就做；` +
+            `若无需用户关注，可静默处理、简短收尾。完整结果可用 check_task("${t.id}") 再取。）`,
+        });
+        push('tool_result', { backgroundTask: t.id, status: t.status }, 0);
+        injectedCount += 1;
+      }
     }
-    const systemPrompt = memoryPrompt
-      ? `${systemPromptBase}\n\n${memoryPrompt}`
-      : systemPromptBase;
+
+    // 唤醒轮（userInput===null）且没有任何新完成任务可注入 → no-op，不打扰 LLM。
+    if (userInput === null && injectedCount === 0) {
+      return {
+        finalAnswer: '', turns: 0, trace: session.trace.slice(startTrace),
+        systemPromptBase: '', memoryPrompt: '',
+      };
+    }
+
+    // 正常轮才 push 用户消息；唤醒轮没有用户输入。
+    if (userInput !== null) {
+      session.history.push({ role: 'user', content: userInput });
+      push('user_input', { text: userInput }, 0);
+    }
+
+    // ── 冻结的 system prompt（保 provider 前缀缓存）─────────────────────
+    // 首轮构建一次，整会话复用。冻结内容：基座 + identity/preferences 快照 +
+    // 账本指令段 + preset few-shot。这些在会话内视为不变。
+    // 每轮变化的东西（账本"当前内容"、按话题命中的 facts）都不在这里 —— 见下。
+    // 放在压缩之前算：freeze 只读 memory/preset，与 history 无关，不受压缩影响；先算出来
+    // 好让下面的压缩触发判断能把 system 段的 token 算进去（否则会严重低估、偏晚触发）。
+    const userMem: UserMemory | undefined = this.memory
+      ? this.memory.store.load(this.memory.userId) : undefined;
+    const systemPrompt = this.freezeSystemPrompt(session, userMem, userInput, push);
+    // systemPromptBase 供 token 统计/测试用 —— 现在就是冻结后的整段。
+    const systemPromptBase = systemPrompt;
+    // memoryPrompt 字段保留（供 RunResult / token 统计）：现在填冻结快照里的记忆段。
+    const memoryPrompt = userMem
+      ? formatForPrompt(retrieveForQuery(userMem, '', 0)) : '';
+
+    // 会话账本：加载 + 渲染当前内容（不进 system，每轮作为 messages 末尾动态 system 消息注入，
+    // 见 buildMessages）。history 尾部变化不碰缓存前缀。
+    let currentLedger = this.ledger?.store.load(session.id, this.ledger.language ?? 'zh');
+    let ledgerPrompt = '';
+    if (this.ledger && currentLedger) {
+      ledgerPrompt = renderLedgerForPrompt(currentLedger);
+      push('ledger', { phase: 'loaded', items: totalItems(currentLedger) }, 0);
+    }
+
+    // 压缩：让上下文跨会话保持在可控大小。现在 system(冻结) + 账本内容都已算出，
+    // 触发判断按"完整 system 段 + history"估算，不再低估。
+    await this.maybeCompress(session, 0, push, [systemPrompt, ledgerPrompt].filter(Boolean).join('\n\n'), currentLedger);
+
+    // 每轮把账本当前内容拼在 messages 末尾（history 之后），不进 session.history 持久化。
+    const buildMessages = (): Message[] => {
+      const msgs: Message[] = [{ role: 'system', content: systemPrompt }, ...session.history];
+      if (ledgerPrompt) msgs.push({ role: 'system', content: ledgerPrompt });
+      return msgs;
+    };
 
     let finalAnswer: string | null = null;
     let turn = 0;
+    // plan 模式产出（loop 模式保持 undefined，收尾时原样带进 RunResult）。
+    let planOut: { plan: Plan; spans: ExecSpan[]; metrics: PlanMetrics } | undefined;
 
+    // ── 决策模式分叉 ────────────────────────────────────────────────
+    // planMode 开启 → 先规划再执行（planner→verifier→executor→reflector）；
+    // 关闭 → 原 ReAct while 循环（边想边做）。两条路径共用下面的收尾
+    // （账本落盘 + 记忆写入），因为收尾在循环之后、对两者都跑。
+    if (session.state.planMode) {
+      // 唤醒轮无用户输入 —— 给 planner 一个合成目标（历史里已注入任务结果供它规划）。
+      const planInput = userInput ?? '（后台任务已完成，见上方结果；据此规划下一步，或直接收尾。）';
+      const r = await this.runPlanMode(session, planInput, systemPrompt, ledgerPrompt, push, hooks);
+      finalAnswer = r.answer;
+      planOut = { plan: r.plan, spans: r.spans, metrics: r.metrics };
+      turn = 1; // 概念上 plan 模式是"一轮"（一次规划 + 一次执行编排）
+    } else
     while (turn < this.config.maxTurns) {
       turn += 1;
       hooks?.onTurnStart?.(turn);
 
-      const messages: Message[] = [{ role: 'system', content: systemPrompt }, ...session.history];
+      // system（冻结，缓存前缀）+ history + 账本当前内容（末尾动态 system）。
+      const messages = buildMessages();
 
-      let raw: string;
+      let assistantTurn;
       try {
-        raw = await this.llm.chat(messages, {
+        assistantTurn = await this.llm.chat({
+          messages,
+          tools: this.registry.toSpecs(),
+          toolChoice: 'auto',
           onDelta: hooks?.onDelta ? (chunk) => hooks.onDelta!(chunk, turn) : undefined,
+          onReasoningDelta: hooks?.onReasoningDelta ? (chunk) => hooks.onReasoningDelta!(chunk, turn) : undefined,
+          signal: hooks?.signal,
         });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        // 用户主动打断（Esc）：不是错误，正常收尾。断流时已流式产出的文本仍保留在 UI，
+        // 但这轮没拿到完整 assistantTurn，不塞进 history（避免半截 assistant 破坏多轮回传）。
+        if (hooks?.signal?.aborted) {
+          push('final', { answer: '', interrupted: true }, turn);
+          finalAnswer = '（已打断 / interrupted）';
+          break;
+        }
+        let msg = err instanceof Error ? err.message : String(err);
+        // 空闲超时：fetch 被 abort(reason) 掐断，裸错误是 "This operation was aborted"（无信息量）。
+        // 把 signal.reason 里带的 LLMTimeoutError 信息翻出来，让用户看到真实原因。
+        const isAbort = err instanceof Error && (err.name === 'AbortError' || /aborted/i.test(err.message));
+        if (isAbort) {
+          const reason = (err as { cause?: unknown }).cause;
+          msg = reason instanceof Error ? reason.message
+            : 'LLM 响应超时被中断（空闲超时）。若回复本应很长，可调大环境变量 LLM_TIMEOUT_MS。';
+        }
+        // LLMHttpError 带 provider 返回的 body —— 400 的真正原因在这里，一定要带出来。
+        const body = (err as { body?: string }).body;
+        if (body) msg += ` — ${body}`;
         push('error', { where: 'llm', message: msg }, turn);
         session.history.push({
           role: 'assistant',
@@ -207,110 +476,114 @@ export class Agent {
         break;
       }
 
-      push('llm_response', { raw }, turn);
+      push('llm_response', { text: assistantTurn.text, toolCalls: assistantTurn.toolCalls.length }, turn);
 
-      let decision;
-      try {
-        decision = parseAgentOutput(raw);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        push('error', { where: 'parse', message: msg, raw }, turn);
-        // 把错误信息回喂给模型，给它一次自己修正格式的机会。
-        session.history.push({ role: 'assistant', content: raw });
-        session.history.push({
-          role: 'user',
-          content:
-            `你上一条消息无法解析（${msg}）。请只输出规定格式的那一个 JSON 对象，前后不要有任何其它文字。`,
-        });
-        continue;
-      }
+      // 把 assistant 回合原样塞进历史 —— 带上 toolCalls / thinking / providerRaw，
+      // 保证多轮回传时 provider 能拿到完整的 tool_use / thinking block 结构。
+      session.history.push({
+        role: 'assistant',
+        content: assistantTurn.text,
+        toolCalls: assistantTurn.toolCalls.length ? assistantTurn.toolCalls : undefined,
+        thinking: assistantTurn.thinking,
+        providerRaw: assistantTurn.raw,
+      });
 
-      // 把助手的原始 JSON 回复也塞进历史，让它以后能引用自己的推理。
-      session.history.push({ role: 'assistant', content: raw });
-
-      if (decision.action === 'final_answer') {
-        push('final', { answer: decision.final, thought: decision.thought }, turn);
-        finalAnswer = decision.final!;
+      // 没有工具调用 = 模型选择直接回答，本轮就是最终答复。
+      if (assistantTurn.toolCalls.length === 0) {
+        push('final', { answer: assistantTurn.text }, turn);
+        finalAnswer = assistantTurn.text;
         break;
       }
 
-      // tool_call
-      const call = decision.tool!;
-
-      // 审批门：若工具在 requireApproval 里，且尚未获得 session 级放行，弹审批。
-      // 存进 session.state 的是 string[]（Set 无法 JSON 序列化，重启会变成 {} 而崩溃）。
-      //
-      // 重要：tool_call 的 trace 事件在**审批通过之后**才推。REPL 的 liveTrace 会用它触发
-      // "执行中" spinner —— 如果推早了，审批面板还在弹用户还在选择，屏幕下方就会先出现
-      // 一个转圈说"执行 xxx"，看起来像工具已经在跑了。
-      let approvalDenied: string | null = null;
-      if (this.config.requireApproval?.has(call.name)) {
-        const raw = session.state.__approvedTools;
-        const approved: string[] = Array.isArray(raw) ? (raw as string[]) : [];
-        if (!approved.includes(call.name)) {
-          if (!this.config.approve) {
-            approvalDenied = '当前 agent 未配置审批器，且该工具需要审批 → fail-closed 拒绝';
-          } else {
-            const decisionA = await this.config.approve({
-              toolName: call.name, args: call.args, turn, sessionId: session.id,
-            });
-            push('memory', { phase: 'approval', tool: call.name, decision: decisionA }, turn);
-            if (decisionA === 'deny') {
-              approvalDenied = '用户拒绝了本次工具调用';
-            } else if (decisionA === 'approve_session') {
-              approved.push(call.name);
-              session.state.__approvedTools = approved;
+      // 有工具调用（可能并行多个）—— 逐个走审批门 + 执行，结果作为 role:"tool" 消息回传。
+      for (const call of assistantTurn.toolCalls) {
+        // 审批门：工具在 requireApproval 里且未获本次进程内的会话放行 → 弹审批。
+        // 放行名单走进程内存（sessionApprovals），不落盘 —— 重启后重新询问。
+        let approvalDenied: string | null = null;
+        if (this.config.requireApproval?.has(call.name)) {
+          const approved = this.approvedSet(session.id);
+          if (!approved.has(call.name)) {
+            if (!this.config.approve) {
+              approvalDenied = '当前 agent 未配置审批器，且该工具需要审批 → fail-closed 拒绝';
+            } else {
+              // approve() 抛错时按 deny 处理 —— 绝不能让异常冒出循环，否则这条 assistant
+              // 已带 tool_calls 进了 history，却没有对应 tool 结果，下一轮回传就 400。
+              let decisionA: ApprovalDecision;
+              try {
+                decisionA = await this.config.approve({
+                  toolName: call.name, args: call.args, turn, sessionId: session.id,
+                });
+              } catch (err) {
+                decisionA = 'deny';
+                push('error', { where: 'approval', name: call.name, message: (err as Error).message }, turn);
+              }
+              push('memory', { phase: 'approval', tool: call.name, decision: decisionA }, turn);
+              if (decisionA === 'deny') {
+                approvalDenied = '用户拒绝了本次工具调用';
+              } else if (decisionA === 'approve_session') {
+                approved.add(call.name);
+              }
             }
           }
         }
-      }
 
-      // 审批已完成（通过 / 拒绝 / 未配置审批器兜底），现在再推 tool_call trace，
-      // 让 REPL 只在真要执行时才起 spinner。
-      push('tool_call', { name: call.name, args: call.args, thought: decision.thought }, turn);
+        push('tool_call', { name: call.name, args: call.args }, turn);
 
-      let toolContent: string;
-      if (approvalDenied) {
-        toolContent = JSON.stringify({
-          ok: false,
-          error: { kind: 'denied', message: approvalDenied },
-        });
-        push('error', { where: 'tool', name: call.name, kind: 'denied', message: approvalDenied }, turn);
-      } else {
-        try {
-          const result = await this.registry.invoke(call.name, call.args, {
-            sessionId: session.id,
-            sessionState: session.state,
-            logger: (m) => push('tool_call', { log: m, name: call.name }, turn),
-            memory: this.memory
-              ? makeMemoryHandle(this.memory.store, this.memory.userId, session.id)
-              : undefined,
-            skills: this.skillHandle(),
-          });
-          toolContent = JSON.stringify({ ok: true, result });
-          push('tool_result', { name: call.name, result }, turn);
-        } catch (err) {
-          const kind =
-            err instanceof ToolNotFoundError
-              ? 'not_found'
-              : err instanceof ToolValidationError
-              ? 'validation'
-              : err instanceof ToolExecutionError
-              ? 'execution'
+        let toolContent: string;
+        if (call.parseError) {
+          // 参数 JSON 没解析成功（多半被 max_tokens 截断）——别拿空 args 跑校验误报"缺参数"，
+          // 直接把真实原因回喂给模型让它重发这次调用。
+          toolContent = JSON.stringify({ ok: false, error: { kind: 'args_parse', message: call.parseError } });
+          push('error', { where: 'tool', name: call.name, kind: 'args_parse', message: call.parseError }, turn);
+        } else if (approvalDenied) {
+          toolContent = JSON.stringify({ ok: false, error: { kind: 'denied', message: approvalDenied } });
+          push('error', { where: 'tool', name: call.name, kind: 'denied', message: approvalDenied }, turn);
+        } else {
+          try {
+            const result = await this.registry.invoke(call.name, call.args, {
+              sessionId: session.id,
+              sessionState: session.state,
+              logger: (m) => push('tool_call', { log: m, name: call.name }, turn),
+              memory: this.memory
+                ? makeMemoryHandle(this.memory.store, this.memory.userId, session.id)
+                : undefined,
+              skills: this.skillHandle(),
+              ledger: currentLedger ? this.makeLedgerHandle(currentLedger, turn, push) : undefined,
+              tasks: this.taskHandle(session.id),
+            });
+            toolContent = JSON.stringify({ ok: true, result });
+            push('tool_result', { name: call.name, result }, turn);
+          } catch (err) {
+            const kind =
+              err instanceof ToolNotFoundError ? 'not_found'
+              : err instanceof ToolValidationError ? 'validation'
+              : err instanceof ToolExecutionError ? 'execution'
               : 'unknown';
-          const message = err instanceof Error ? err.message : String(err);
-          toolContent = JSON.stringify({ ok: false, error: { kind, message } });
-          push('error', { where: 'tool', name: call.name, kind, message }, turn);
+            const message = err instanceof Error ? err.message : String(err);
+            toolContent = JSON.stringify({ ok: false, error: { kind, message } });
+            push('error', { where: 'tool', name: call.name, kind, message }, turn);
+          }
         }
+
+        // 每个 tool call 回一条 role:"tool" 消息，用 toolCallId 对应（原生协议要求）。
+        session.history.push({
+          role: 'tool',
+          toolName: call.name,
+          toolCallId: call.id,
+          content: toolContent,
+        });
       }
 
-      session.history.push({
-        role: 'tool',
-        toolName: call.name,
-        content: toolContent,
-      });
+      // 用户打断：工具已跑完（这批 tool 结果已进 history，多轮回传结构完整），到此正常收尾，
+      // 不再进下一轮 LLM 调用。放在这里而非循环顶 —— 保证不留悬空 tool_call。
+      if (hooks?.signal?.aborted) {
+        push('final', { answer: '', interrupted: true }, turn);
+        finalAnswer = '（已打断 / interrupted）';
+        break;
+      }
 
-      await this.maybeCompress(session, turn, push);
+      // 触发条件按"完整 system prompt token + history token"估算。
+      await this.maybeCompress(session, turn, push, systemPrompt, currentLedger);
     }
 
     if (finalAnswer === null) {
@@ -319,25 +592,34 @@ export class Agent {
       session.history.push({ role: 'assistant', content: `[agent] ${finalAnswer}` });
     }
 
-    // 抽取（ingest）：从本轮对话里提取持久事实，合并到用户 memory 中。
-    // 同步执行，但整个块用 try/catch 包住，抽取器出 bug 绝不能拖垮一次聊天。
-    if (this.memory && !this.memory.disableIngest && userMem) {
+    // 账本落盘。chat 结束时统一保存，不每轮 patch 都写盘（IO 摊薄）。
+    if (this.ledger && currentLedger) {
       try {
-        const transcript = `user: ${userInput}\nassistant: ${finalAnswer}`;
-        const { candidates } = await extractFacts(this.llm, transcript);
-        if (candidates.length) {
-          const report = mergeCandidates(userMem, candidates,
-            { session: session.id, turn }, Date.now());
-          this.memory.store.save(userMem);
-          push('memory', {
-            phase: 'ingest',
-            added: report.added.length,
-            updated: report.updated.length,
-            superseded: report.superseded.length,
-          }, turn);
-        }
+        this.ledger.store.save(currentLedger);
       } catch (err) {
-        push('error', { where: 'memory_ingest', message: (err as Error).message }, turn);
+        push('error', { where: 'ledger_save', message: (err as Error).message }, turn);
+      }
+    }
+
+    // 记忆写入 —— 账本沉淀为唯一自动写入路径（extractor 每轮抽取已废弃删除）：
+    //   会话被 LLM 标记为 wrapping/closed 时，把账本条目路由到 memory（consolidateLedgerToMemory）。
+    //   另一条写入路径是用户显式的 memory 工具（add/forget），不在这里。
+    const ledgerWraps = currentLedger?.core.state === 'wrapping'
+                     || currentLedger?.core.state === 'closed';
+    if (this.memory && !this.memory.disableIngest && userMem
+        && this.ledger && currentLedger && ledgerWraps) {
+      try {
+        const report = consolidateLedgerToMemory(currentLedger, userMem, Date.now());
+        this.memory.store.save(userMem);
+        push('memory', {
+          phase: 'consolidate',
+          candidates: report.candidates,
+          added: report.merge.added.length,
+          updated: report.merge.updated.length,
+          superseded: report.merge.superseded.length,
+        }, turn);
+      } catch (err) {
+        push('error', { where: 'memory_consolidate', message: (err as Error).message }, turn);
       }
     }
 
@@ -347,14 +629,254 @@ export class Agent {
       trace: session.trace.slice(startTrace),
       systemPromptBase,
       memoryPrompt,
+      ledgerPrompt: ledgerPrompt || undefined,
+      plan: planOut?.plan,
+      spans: planOut?.spans,
+      planMetrics: planOut?.metrics,
     };
+  }
+
+  /**
+   * plan 模式的编排：planner → verifier →（重试）→ executor →（reflect 重试）。
+   * 复用 plan/ 下的纯函数，但跑在同一个 Agent / session 上，因此天然拥有记忆、账本、
+   * 技能、后台任务 —— 这些是 plan 模式作为「同一个 agent 的一个决策模式」白拿的。
+   *
+   * 记忆/账本注入：planner 有自己的 system prompt（角色 + 工具清单），这里把
+   * memory/ledger 段作为**前置 system 消息**塞进 planner 看到的 history，让它带着
+   * 跨会话记忆和会话账本去规划，而不与 planner 的角色 prompt 冲突。
+   */
+  private async runPlanMode(
+    session: Session,
+    userInput: string,
+    frozenSystem: string,
+    ledgerPrompt: string,
+    push: (kind: TraceEntry['kind'], data: unknown, turn: number) => void,
+    hooks?: {
+      onSpan?: (span: ExecSpan) => void;
+      onPlanDelta?: (chunk: string, phase: 'planner' | 'reflector') => void;
+    },
+  ): Promise<{ answer: string; plan: Plan; spans: ExecSpan[]; metrics: PlanMetrics }> {
+    const maxReflections = this.config.planReflections ?? 2;
+    const maxVerifyRetries = this.config.planVerifyRetries ?? 2;
+    const start = Date.now();
+    const metrics: PlanMetrics = {
+      planner_calls: 0, reflector_calls: 0, verify_attempts: 0, execute_attempts: 0, elapsed_ms: 0,
+    };
+    const allSpans: ExecSpan[] = [];
+    const collectSpans = (s: ExecSpan) => { allSpans.push(s); hooks?.onSpan?.(s); };
+
+    // 记忆/账本作为前置 system 消息注入 planner 上下文（非空才注入）。
+    // planner 有自己的角色 system prompt（plannerSystemPrompt），所以这里不注入 loop 基座，
+    // 只把跨会话记忆快照（identity/preferences）+ 账本当前内容作为上下文喂给它。
+    // frozenSystem 参数在 plan 模式下不直接用（planner 自带 system），保留签名对齐 loop 侧语义。
+    void frozenSystem;
+    const memSnapshot = this.memory
+      ? formatForPrompt(retrieveForQuery(this.memory.store.load(this.memory.userId), '', 0)) : '';
+    const contextSeg = [memSnapshot, ledgerPrompt].filter((s) => s && s.length).join('\n\n');
+    const planContextHistory: Message[] = contextSeg
+      ? [{ role: 'system', content: contextSeg }, ...session.history]
+      : [...session.history];
+
+    // 审批门：复用进程内存的会话放行名单，适配成 executor 的 beforeTool 钩子。
+    const beforeTool = async (info: { tool: string; args: Record<string, unknown>; stepId: string }): Promise<boolean> => {
+      if (!this.config.requireApproval?.has(info.tool)) return true;
+      const approved = this.approvedSet(session.id);
+      if (approved.has(info.tool)) return true;
+      if (!this.config.approve) return false;
+      const decision = await this.config.approve({
+        toolName: info.tool, args: info.args, turn: 1, sessionId: session.id,
+      });
+      if (decision === 'deny') return false;
+      if (decision === 'approve_session') approved.add(info.tool);
+      return true;
+    };
+
+    // synthesize：供 respond 步骤 synthesize=true 时产出最终文本。
+    const synthesize = async (input: {
+      guidance: string;
+      outputs: Record<string, { ok: boolean; result?: unknown; error?: string }>;
+      userInput?: string;
+    }): Promise<string> => {
+      const sys: Message = {
+        role: 'system',
+        content:
+          `你是 LinAgent 的 Synthesizer（综合器）。所有工具都已被 runtime 执行完毕。` +
+          `请基于 (a) 用户原始请求、(b) planner 的简短指令、(c) 工具的原始输出，产出简洁的最终回答。` +
+          `不要再提出新的工具调用。直接输出纯文本。`,
+      };
+      const usr: Message = {
+        role: 'user',
+        content:
+          `用户请求：\n${input.userInput ?? ''}\n\n` +
+          `Planner 指令：\n${input.guidance}\n\n工具输出：\n${JSON.stringify(input.outputs, null, 2)}`,
+      };
+      return (await this.llm.complete([sys, usr], { temperature: 0.2 })).trim();
+    };
+
+    // ── 1. 规划 + 校验（校验失败让 planner 重来） ─────────────────────
+    let plan: Plan;
+    let planRaw = '';
+    let extraHistory: Message[] = [];
+    for (let attempt = 0; attempt <= maxVerifyRetries; attempt++) {
+      // planner 调用本身可能失败（输出被截断 / 返回空 → PlannerError）。这类失败也算一次
+      // 尝试：只要还有重试额度就重来，而不是让异常冒出整轮把 plan 模式打死。
+      let p;
+      try {
+        p = await callPlanner(this.llm, this.registry, {
+          history: [...planContextHistory, ...extraHistory],
+          onDelta: hooks?.onPlanDelta ? (ch) => hooks.onPlanDelta!(ch, 'planner') : undefined,
+        });
+      } catch (err) {
+        if (!(err instanceof PlannerError)) throw err;
+        metrics.planner_calls += 1;
+        push('plan', { phase: 'planner_error', attempt, message: err.message }, 1);
+        if (attempt === maxVerifyRetries) throw err;
+        // 让下一次重试更短、更聚焦，降低再次被截断的概率。
+        extraHistory = [
+          { role: 'user', content: `上次没能拿到你的 Plan：${err.message}。请重新输出一份**完整**的 Plan JSON，尽量精简步骤，确保 JSON 完整闭合。` },
+        ];
+        continue;
+      }
+      plan = p.plan;
+      planRaw = p.raw;
+      metrics.planner_calls += 1;
+      metrics.verify_attempts += 1;
+      push('plan', { phase: 'planned', steps: plan.steps.length, attempt }, 1);
+      try {
+        verifyPlan(plan, this.registry);
+        break;
+      } catch (err) {
+        if (!(err instanceof PlanVerifyError)) throw err;
+        if (attempt === maxVerifyRetries) {
+          throw new PlannerError(`planner 连续 ${attempt + 1} 次未通过校验：${err.issues.join('; ')}`);
+        }
+        extraHistory = [
+          { role: 'assistant', content: planRaw },
+          { role: 'user', content: `你上一份 plan 校验未通过：\n- ${err.issues.join('\n- ')}\n请重新输出修正后的 Plan JSON。` },
+        ];
+      }
+    }
+
+    // ── 2. 执行；失败则 reflect 重试 ─────────────────────────────────
+    let execResult;
+    for (let reflection = 0; reflection <= maxReflections; reflection++) {
+      metrics.execute_attempts += 1;
+      execResult = await executePlan(plan!, this.registry, session, {
+        onSpan: collectSpans, synthesize, userInput, beforeTool,
+      });
+      if (!execResult.failed_step) break;
+
+      if (reflection === maxReflections) {
+        metrics.elapsed_ms = Date.now() - start;
+        const fallback = `抱歉，我没能完成这个请求。最后一次失败在步骤 "${execResult.failed_step}"：${execResult.failure_reason}`;
+        session.history.push({ role: 'assistant', content: fallback });
+        return { answer: fallback, plan: plan!, spans: allSpans, metrics };
+      }
+      const r = await callReflector(this.llm, this.registry, {
+        history: session.history, previousPlan: plan!, execResult,
+        onDelta: hooks?.onPlanDelta ? (ch) => hooks.onPlanDelta!(ch, 'reflector') : undefined,
+      });
+      metrics.reflector_calls += 1;
+      plan = applyPatch(plan!, r.patch);
+      try { verifyPlan(plan, this.registry); }
+      catch (err) {
+        if (!(err instanceof PlanVerifyError)) throw err;
+        metrics.elapsed_ms = Date.now() - start;
+        const fallback = `Reflector 产出的 patch 不合法：${err.issues.join('; ')}`;
+        session.history.push({ role: 'assistant', content: fallback });
+        return { answer: fallback, plan, spans: allSpans, metrics };
+      }
+    }
+
+    // ── 3. 取最终答复 ───────────────────────────────────────────────
+    metrics.elapsed_ms = Date.now() - start;
+    const answer = execResult!.answer ?? '(没有产出答复)';
+    session.history.push({ role: 'assistant', content: answer });
+    push('final', { answer }, 1);
+    return { answer, plan: plan!, spans: allSpans, metrics };
+  }
+
+  /**
+   * 构建/取回会话级冻结的 system prompt。首轮构建，之后整会话复用（保 provider 前缀缓存）。
+   *
+   * 冻结内容（会话内视为不变）：
+   *   1. 基座（buildSystemPrompt：角色/能力/准则 + skill 清单 + MCP 资源）
+   *   2. identity/preferences 记忆快照（"每次都注入"层，与 query 无关，会话内稳定）
+   *   3. 账本指令段（buildLedgerInstruction）+ 选定的 preset few-shot
+   *
+   * 不含：facts/ongoing（改 recall_memory 按需查）、账本当前内容（每轮走 messages 末尾）。
+   * key 含 planMode —— 切模式换基座描述会自然重新冻结。
+   */
+  private freezeSystemPrompt(
+    session: Session,
+    userMem: UserMemory | undefined,
+    userInput: string | null,
+    push: (kind: TraceEntry['kind'], data: unknown, turn: number) => void,
+  ): string {
+    const key = `${session.id}|${session.state.planMode ? 'plan' : 'loop'}`;
+    const cached = this.frozenSystemPrompt.get(key);
+    if (cached !== undefined) return cached;
+
+    const skillList = this.skills?.describeForPrompt() || undefined;
+    const base = buildSystemPrompt(this.registry, skillList, this.config.mcpResources);
+
+    // identity/preferences 快照：空 query 只取"每次都注入"的两层。
+    let memSnapshot = '';
+    if (userMem) {
+      memSnapshot = formatForPrompt(retrieveForQuery(userMem, '', 0));
+      push('memory', { phase: 'freeze', snapshot: memSnapshot ? 'identity+preferences' : 'empty' }, 0);
+    }
+
+    // 账本指令 + preset few-shot（只影响引导，不含账本当前内容）。
+    // preset 用**首轮的真实用户输入 + 账本 intent** 来选 —— 这是账本"自演化对话类型"的入口：
+    // 排错会话选 debug preset、执行会话选 execution preset…（用 session.title 选会永远命中不了
+    // 关键词、退化成 default）。freeze 只发生在首轮，选定后整会话冻结，符合保缓存约束。
+    // 唤醒轮无用户输入 → 用 title 兜底（唤醒轮极少是首轮）。
+    let ledgerSeg = '';
+    if (this.ledger) {
+      const ledger = this.ledger.store.load(session.id, this.ledger.language ?? 'zh');
+      const presetQuery = userInput ?? session.title;
+      const sel = pickPreset(ledger, presetQuery, this.ledger.presets);
+      ledger.preset_used = sel.preset.name;
+      try { this.ledger.store.save(ledger); } catch { /* preset_used 落盘失败不阻塞 */ }
+      push('ledger', { phase: 'preset_frozen', preset: sel.preset.name, score: sel.score, reason: sel.reason }, 0);
+      const fewShot = renderPresetFewShot(sel.preset);
+      ledgerSeg = [buildLedgerInstruction(), fewShot].filter((s) => s && s.length).join('\n\n');
+    }
+
+    const frozen = [base, memSnapshot, ledgerSeg].filter((s) => s && s.length).join('\n\n');
+    this.frozenSystemPrompt.set(key, frozen);
+    return frozen;
   }
 
   private async maybeCompress(
     session: Session,
     turn: number,
     push: (kind: TraceEntry['kind'], data: unknown, turn: number) => void,
+    extraSystemText?: string,
+    currentLedger?: import('./ledger/index.ts').Ledger,
   ): Promise<void> {
+    // 若配了账本 archive → 走新压缩路径（账本驱动、非破坏性归档）
+    if (this.ledger?.archive) {
+      const cfg = buildTriggerConfig(this.ledger.trigger);
+      const out = tryCompress({
+        session_id: session.id,
+        history: session.history,
+        ledger: currentLedger,
+        extraSystemText: extraSystemText ?? '',
+        turn,
+        cfg,
+        archive: this.ledger.archive,
+        presets: this.ledger.presets,
+      });
+      if (out.compressed) {
+        session.history = out.history;
+        push('compress', compressTraceData(out), turn);
+      }
+      return;
+    }
+
+    // 兜底：旧的 FIFO 摘要路径（未启用账本 archive 时保持向后兼容）
     const result = await compressIfNeeded(
       session.history,
       this.config.context,
@@ -368,4 +890,72 @@ export class Agent {
       push('compress', { folded: result.folded, kept: result.history.length }, turn);
     }
   }
+
+  /**
+   * 手动压缩当前会话（供 REPL 的 /compress 命令用）。
+   * 与自动压缩走同一条账本驱动路径，但 force=true 跳过 token 阈值 —— 用户明确要求
+   * 压缩就立刻压，不管有没有到 60%。仍要求 history 有可归档的中段（太短则 no-op）。
+   *
+   * 账本本身作为"活摘要"保留在会话里；被折叠的原始消息归档到 archive，可 recall_archive 拉回。
+   * 返回压缩报告，UI 决定怎么展示；未启用账本 archive 时返回 { compressed:false }。
+   */
+  async compressNow(session: Session): Promise<ManualCompressResult> {
+    if (!this.ledger?.archive) {
+      return {
+        compressed: false, archived: 0, merged: 0, deleted: 0, conversationClass: 'default',
+        beforeTokens: 0, afterTokens: 0, savedPct: 0, ledgerItems: 0,
+      };
+    }
+    const cfg = buildTriggerConfig(this.ledger.trigger);
+    // 重建每轮临时拼进 system 的额外文本，好让 token 估算贴近真实输入。
+    const ledger = this.ledger.store.load(session.id, this.ledger.language ?? 'zh');
+    const skillList = this.skills?.describeForPrompt() || undefined;
+    const base = buildSystemPrompt(this.registry, skillList, this.config.mcpResources);
+    const ledgerText = ledger ? renderLedgerForPrompt(ledger) : '';
+    const out = tryCompress({
+      session_id: session.id,
+      history: session.history,
+      ledger,
+      extraSystemText: [base, ledgerText].filter(Boolean).join('\n\n'),
+      turn: session.trace.length,
+      cfg,
+      archive: this.ledger.archive,
+      presets: this.ledger.presets,
+      force: true,
+    });
+    if (out.compressed) {
+      session.history = out.history;
+      if (ledger) { try { this.ledger.store.save(ledger); } catch { /* 账本 archived_ref 落盘失败不阻塞 */ } }
+      const entry: TraceEntry = { turn: 0, timestamp: Date.now(), kind: 'compress', data: compressTraceData(out) };
+      session.trace.push(entry);
+      this.config.onTrace?.(entry);
+    }
+    // 账本条目数：为 0 说明这轮没维护账本 —— 压缩只归档了原文、没有结构化摘要留在上下文。
+    // UI 据此提醒用户，避免误以为压缩后上下文里还有"这段讲了啥"的浓缩。
+    return { ...compressTraceData(out), ledgerItems: ledger ? totalItems(ledger) : 0 };
+  }
+}
+
+/**
+ * 注入后台任务结果时的长度上限 —— workflow 汇总 / bash 输出可能很大，
+ * 一次全量注入会撑爆上下文、触发压缩抖动。截断后提示用 check_task 取全量。
+ */
+const INJECT_MAX_CHARS = 2000;
+function truncateForInject(s: string): string {
+  if (s.length <= INJECT_MAX_CHARS) return s;
+  return `${s.slice(0, INJECT_MAX_CHARS)}…[已截断 ${s.length - INJECT_MAX_CHARS} 字符，完整结果用 check_task 取]`;
+}
+
+/** 数所有账本条目的总数，用于 trace 展示。 */
+function totalItems(l: import('./ledger/index.ts').Ledger): number {
+  let n = 0;
+  const s = l.suggested;
+  n += s.progress?.length ?? 0;
+  n += s.findings?.length ?? 0;
+  n += s.decisions?.length ?? 0;
+  n += s.open_threads?.length ?? 0;
+  n += s.blockers?.length ?? 0;
+  n += s.artifacts?.length ?? 0;
+  for (const arr of Object.values(l.custom)) n += arr.length;
+  return n;
 }

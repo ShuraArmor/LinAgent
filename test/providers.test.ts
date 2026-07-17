@@ -24,7 +24,7 @@ test('providers: anthropic preset picks anthropic protocol', () => {
 test('providers: unknown provider produces a helpful error', () => {
   assert.throws(
     () => buildLLMFromEnv({ LLM_PROVIDER: 'nope', LLM_API_KEY: 'x' } as NodeJS.ProcessEnv),
-    /Unknown LLM_PROVIDER/,
+    /Unknown provider/,
   );
 });
 
@@ -44,7 +44,7 @@ test('providers: LLM_API_KEY beats conventional env var', () => {
         LLM_PROVIDER: 'moonshot',
         // no key of either kind
       } as NodeJS.ProcessEnv),
-    /is not set/,
+    /API key 未设置/,
   );
 });
 
