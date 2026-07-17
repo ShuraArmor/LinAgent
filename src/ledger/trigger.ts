@@ -9,8 +9,9 @@
  *   trigger = totalInputTokens >= usable * threshold_percent
  *
  * outputReserve 默认 20k（给模型的输出留 buffer，避免"输入撑满、输出被卡"）。
- * threshold_percent 默认 0.60（相比 opencode/hermes 的 0.50 略保守一点，因为我们的
- * token 估算精度只在 ±20% 左右，宁可早一点触发，别真撑到超限）。
+ * threshold_percent 默认 0.85 —— 只在上下文"快满"时才压，别频繁打断对话。
+ * token 估算有 ±20% 误差，但 20k 的 outputReserve 足够吸收，85% 仍安全。
+ * 手动 /compress 无视此阈值，force 立即压。
  *
  * 关于抖动：压缩是**零 LLM** 的（合并摘要靠账本渲染，见 compressor.ts），即使连续几轮都
  * 触发也只是廉价的数组重排，没有"摘要器空转"的成本，因此不需要 back-off 机制。
@@ -20,7 +21,7 @@ import type { Message } from '../types.ts';
 import { estimateTokensOfMessage, estimateTokensOfText } from '../tokens.ts';
 
 export interface CompressionTriggerConfig {
-  /** 上下文窗口大小（token）。默认取 contextWindow() = 128k。 */
+  /** 上下文窗口大小（token）。默认 1M（DeepSeek-V4），用 LLM_CONTEXT_WINDOW 覆盖。 */
   contextWindow: number;
   /** 为输出预留的 token 数。默认 20000。 */
   outputReserve: number;
@@ -33,9 +34,9 @@ export interface CompressionTriggerConfig {
 }
 
 export const DEFAULT_TRIGGER: CompressionTriggerConfig = {
-  contextWindow: 128_000,
+  contextWindow: 1_048_576,
   outputReserve: 20_000,
-  thresholdPercent: 0.60,
+  thresholdPercent: 0.85,
   tailBudgetPercent: 0.20,
   minTailMessages: 4,
 };

@@ -1,0 +1,42 @@
+
+@app.post("/api/sim/interactive")
+def interactive_sim(req: InteractiveSimReq):
+    bridge = get_bridge()
+    model = bridge.model_loaded
+    if not model:
+        raise HTTPException(400, "No model loaded")
+
+    t0 = time.time()
+
+    # 设置 block_params
+    for block_path, val in req.block_params.items():
+        try:
+            bridge.set_param(block_path, "Value", str(val))
+        except Exception as e:
+            log(f"Warn: set {block_path} = {val} failed: {e}")
+
+    # 设置 inports
+    for port_name, val in req.inports.items():
+        bridge.set_variable(port_name, float(val))
+
+    # 用 MATLAB eval 启用所有 Outport 的 DataLogging（修复：子系统中 Outport 不输信号的问题）
+    try:
+        bridge.engine.eval(
+            "ops=find_system('" + model + "', 'BlockType', 'Outport');"
+            "for i=1:length(ops), set_param(ops{i}, 'DataLogging', 'on'); end; clear ops",
+            nargout=0
+        )
+    except Exception:
+        pass
+
+    log(f"Interactive sim: params={len(req.block_params)}, stop_time={req.stop_time}")
+    result = bridge.sim_with_output(model, req.stop_time)
+    result["elapsed"] = round(time.time() - t0, 3)
+    result["block_params"] = req.block_params
+    result["inputs"] = req.inports
+
+    global _last_sim_result
+    _last_sim_result = result
+    n_sig = len(result.get("signals", {}))
+    log(f"Interactive sim done: {result['elapsed']}s, {len(result.get('time', []))} time points, {n_sig} signals")
+    return result

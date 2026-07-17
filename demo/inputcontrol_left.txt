@@ -1,0 +1,48 @@
+        {/* 左 — 参数 */}
+        <div style={{width:260,flexShrink:0,overflowY:'auto',borderRight:'1px solid var(--border)',background:'#F8F8F8',padding:8}}>
+          {!activeSS ? (
+            <div style={{fontSize:13,color:'var(--text-muted)',padding:20,textAlign:'center'}}>请在上方选择一个子系统</div>
+          ) : (
+            <>
+              {/* 端口信息（与属性检查器一致） */}
+              {activeSS.inports && activeSS.inports.length > 0 && (
+                <div style={{marginBottom:12}}>
+                  <div style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',marginBottom:4,textTransform:'uppercase'}}>输入端口 ({activeSS.inports.length})</div>
+                  {activeSS.inports.map(p => (
+                    <div key={p.name} style={{display:'flex',justifyContent:'space-between',padding:'2px 0',fontSize:11,borderBottom:'1px solid #ECECEC'}}>
+                      <span style={{fontWeight:500}}>{p.name}</span>
+                      <span style={{color:'var(--text-muted)',fontFamily:'var(--font-mono)'}}>端口 {p.port}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {activeSS.outports && activeSS.outports.length > 0 && (
+                <div style={{marginBottom:12}}>
+                  <div style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',marginBottom:4,textTransform:'uppercase'}}>输出端口 ({activeSS.outports.length})</div>
+                  {activeSS.outports.map(p => (
+                    <div key={p.name} style={{display:'flex',justifyContent:'space-between',padding:'2px 0',fontSize:11,borderBottom:'1px solid #ECECEC'}}>
+                      <span style={{fontWeight:500}}>{p.name}</span>
+                      <span style={{color:'var(--text-muted)',fontFamily:'var(--font-mono)'}}>端口 {p.port}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* 分隔 */}
+              <div style={{borderTop:'2px solid var(--border)',margin:'8px 0 10px'}} />
+
+              {/* 可调参数 */}
+              <div style={{fontSize:10,fontWeight:600,color:'var(--text-muted)',marginBottom:6,textTransform:'uppercase'}}>可调参数 ({params.length})</div>
+              {params.length===0 ? <div style={{fontSize:12,color:'var(--text-muted)',fontStyle:'italic'}}>{blockParamsLoaded?'此子系统无 Constant/Gain 块':'加载中...'}</div>
+              : params.map(([path,meta])=>{
+                const val=meta.value; const name=path.split('/').pop(); const r=sr(name,val);
+                return (<div key={path} style={{marginBottom:12}}>
+                  <div style={{display:'flex',justifyContent:'space-between',marginBottom:2}}><span style={{fontSize:11,fontWeight:500}}>{name}</span><input type="number" value={val} step={r.st} disabled={busy} onChange={e=>setBlockParams(pr=>({...pr,[path]:{...pr[path],value:parseFloat(e.target.value)||0}}))} style={i(58)}/></div>
+                  <input type="range" min={r.mn} max={r.mx} step={r.st} value={val} disabled={busy} onChange={e=>setBlockParams(pr=>({...pr,[path]:{...pr[path],value:parseFloat(e.target.value)||0}}))} style={{width:'100%',height:4,accentColor:'var(--accent)'}}/>
+                  <div style={{display:'flex',justifyContent:'space-between',fontSize:9,color:'var(--text-muted)'}}><span>{r.mn}</span><span>{r.mx}</span></div>
+                </div>);
+              })}
+            </>
+          )}
+        </div>

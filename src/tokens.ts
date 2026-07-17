@@ -117,12 +117,16 @@ export function totalTokens(b: CategoryBreakdown): number {
   return b.system + b.user + b.assistant + b.tool_result + b.summary + b.memory_facts;
 }
 
-/** 上下文窗口大小（从 env 读，默认 128k）。 */
+/**
+ * 上下文窗口大小（从 env 读，默认 1M）。
+ * 默认对齐 DeepSeek-V4 系列的 1,048,576(2^20) tokens；其它模型窗口不同的，
+ * 用环境变量 LLM_CONTEXT_WINDOW 覆盖（例如老模型填 128000）。
+ */
 export function contextWindow(): number {
   const raw = process.env.LLM_CONTEXT_WINDOW;
-  if (!raw) return 128_000;
+  if (!raw) return 1_048_576;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : 128_000;
+  return Number.isFinite(n) && n > 0 ? n : 1_048_576;
 }
 
 /** 数字友好显示：1234 → "1.2k"、1_234_567 → "1.2M"。 */

@@ -1,5 +1,9 @@
 import React, { useState } from 'react';
-import { Box, Text, useInput } from 'ink';
+import { Box, Text, useInput, useStdout } from 'ink';
+import { wrapCols, displayWidth } from '../width.ts';
+
+/** 输入框最多显示多少行（超出只显示尾部，保证动态区高度受控、不撑破 Ink 原地重绘）。 */
+const MAX_INPUT_ROWS = 6;
 
 export interface InputProps {
   planMode: boolean;
@@ -73,12 +77,34 @@ export function Input({ planMode, sessionTitle, onSubmit, onCtrlC, onInterrupt, 
   }, { isActive: !disabled });
 
   const tagColor = planMode ? 'magenta' : 'blue';
+  const label = ` ${planMode ? 'plan:' : ''}${sessionTitle} `;
+
+  // 高度受控视口：把输入内容按终端宽度换行，只显示尾部 MAX_INPUT_ROWS 行（光标所在的最后
+  // 一行永远可见）。防止长文本把输入框无限撑高 → 动态区超过终端行数 → Ink 放弃原地重绘、
+  // 状态栏被一行行复印进 scrollback（就是"满屏 loop·turn 6"那个 bug）。
+  const { stdout } = useStdout();
+  const cols = stdout?.columns ?? 80;
+  // 正文可用列宽 = 终端宽 − 边框(2) − padding(2) − 标签宽 − " › " − 光标位。留点余量。
+  const budget = Math.max(20, cols - 4 - displayWidth(label) - 4);
+  const wrapped = buf ? wrapCols(buf, budget) : [''];
+  const overflow = wrapped.length > MAX_INPUT_ROWS;
+  const shown = overflow ? wrapped.slice(wrapped.length - MAX_INPUT_ROWS) : wrapped;
+
   return (
-    <Box borderStyle="round" borderColor={tagColor} paddingX={1}>
-      <Text backgroundColor={tagColor} color="white">{` ${planMode ? 'plan:' : ''}${sessionTitle} `}</Text>
-      <Text color="cyan">{' › '}</Text>
-      <Text>{buf}</Text>
-      <Text color="cyan">▌</Text>
+    <Box borderStyle="round" borderColor={tagColor} paddingX={1} flexDirection="column">
+      <Box>
+        <Text backgroundColor={tagColor} color="white">{label}</Text>
+        <Text color="cyan">{' › '}</Text>
+        {overflow && <Text dimColor>{`⋯(+${wrapped.length - MAX_INPUT_ROWS}行) `}</Text>}
+        <Text>{shown[0]}</Text>
+        {shown.length === 1 && <Text color="cyan">▌</Text>}
+      </Box>
+      {shown.slice(1).map((line, i) => (
+        <Text key={i}>
+          {line}
+          {i === shown.length - 2 ? <Text color="cyan">▌</Text> : null}
+        </Text>
+      ))}
     </Box>
   );
 }
