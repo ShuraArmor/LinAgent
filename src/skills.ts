@@ -21,6 +21,10 @@
 
 import { existsSync, readdirSync, readFileSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, dirname, extname } from 'node:path';
+import { platform } from 'node:os';
+
+/** 当前平台默认的脚本运行时——agent 建 skill 没指定 runtime 时用它，保证脚本在本机能跑。 */
+const DEFAULT_RUNTIME = platform() === 'win32' ? 'powershell' : 'bash';
 
 export interface SkillMeta {
   name: string;
@@ -235,9 +239,11 @@ export class SkillRegistry {
     const skillDir = join(this.rootDir, name);
     const mdPath = join(skillDir, 'SKILL.md');
 
-    // 推断脚本文件名
+    // 推断脚本文件名。未显式指定 runtime 时，按**当前平台**兜底（Windows→powershell，
+    // POSIX→bash），避免默认永远 .sh 在 Windows 上跑不了。兜底 runtime 也会写进
+    // frontmatter，让 skill 自描述、下次加载时能被正确识别。
     let scriptFilename = opts?.scriptFilename;
-    const runtime = opts?.runtime;
+    const runtime = opts?.runtime ?? (opts?.script && !scriptFilename ? DEFAULT_RUNTIME : undefined);
     if (opts?.script && !scriptFilename) {
       const ext = runtime === 'python' ? '.py'
         : runtime === 'node' ? '.js'

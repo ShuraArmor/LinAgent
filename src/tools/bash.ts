@@ -18,8 +18,14 @@
 
 import { spawn } from 'node:child_process';
 import { resolve, isAbsolute, relative } from 'node:path';
+import { platform } from 'node:os';
 import type { Tool } from '../types.ts';
 import { getSandboxRoot } from './fs.ts';
+
+/** 当前平台的 shell + 分离启动语法，供工具描述动态拼接（避免在别的系统上误导 LLM）。 */
+const IS_WIN = platform() === 'win32';
+const SHELL_DESC = IS_WIN ? '当前系统是 Windows，命令走 cmd.exe /c' : '当前系统是 POSIX，命令走 /bin/sh -c';
+const DETACH_HINT = IS_WIN ? '用 `start "" 你的命令`' : '用 `nohup 你的命令 >/dev/null 2>&1 &`';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 5 * 60_000;
@@ -170,7 +176,7 @@ export const bashExecTool: Tool = {
   name: 'bash_exec',
   description:
     '在系统 shell 里执行一段命令，返回 exit_code、stdout、stderr。' +
-    'Windows 走 cmd.exe /c，POSIX 走 /bin/sh -c。' +
+    `${SHELL_DESC}——用本系统的命令语法。` +
     '默认 30s 超时（可覆盖，最长 5 分钟），stdout/stderr 各上限 256KB（超过会截断）。' +
     '此工具为高影响动作，每次调用都需要用户审批。' +
     '\n⚠️ 重要：这是**前台阻塞**执行，会一直等到命令结束。' +
@@ -178,7 +184,7 @@ export const bashExecTool: Tool = {
     'watch 模式等——**不要直接在这里跑**，否则会一直卡住直到超时被强杀。正确做法二选一：' +
     '\n  1) 用 spawn_task 把它丢到后台（推荐，能拿到任务句柄、完成后回报）；' +
     '\n  2) 若只是要"启动后不管"，用分离方式让命令立刻返回：' +
-    'Windows 用 `start "" 你的命令`，POSIX 用 `nohup 你的命令 >/dev/null 2>&1 &`。',
+    `${DETACH_HINT}。`,
   parameters: {
     type: 'object',
     properties: {

@@ -1,4 +1,24 @@
 import type { ToolRegistry } from '../tools/registry.ts';
+import { platform, arch, release } from 'node:os';
+
+/**
+ * 把 process.platform 映射成对 LLM 友好的 OS 描述 + shell 语法提示。
+ * 注入进 system prompt，让 agent 在任意系统上都用**本平台**的命令语法
+ * （否则在 Linux/mac 上也会建议 taskkill / start "" 这类 Windows 命令，反之亦然）。
+ * 这些值在同一台机器上是常量，不破坏 system prompt 的会话级冻结缓存。
+ */
+function describeOS(): string {
+  const p = platform();
+  if (p === 'win32') {
+    return `- **当前操作系统**：Windows（${arch()}，内核 ${release()}）。shell 是 **cmd.exe**：`
+      + `路径分隔符用 \\，列目录 \`dir\`、删除 \`del\`、后台启动 \`start "" 命令\`、`
+      + `环境变量 \`%VAR%\`。**不要**用 \`ls\`/\`rm\`/\`nohup\`/\`export\` 这类 POSIX 命令。`;
+  }
+  const name = p === 'darwin' ? 'macOS' : p === 'linux' ? 'Linux' : p;
+  return `- **当前操作系统**：${name}（${arch()}，内核 ${release()}）。shell 是 **POSIX sh**：`
+    + `路径分隔符用 /，列目录 \`ls\`、删除 \`rm\`、后台启动 \`nohup 命令 >/dev/null 2>&1 &\`、`
+    + `环境变量 \`$VAR\`。**不要**用 \`dir\`/\`del\`/\`taskkill\`/\`start\` 这类 Windows 命令。`;
+}
 
 /**
  * 主 system prompt 的**基座段**（详尽版）。
@@ -43,6 +63,7 @@ export function buildSystemPrompt(_registry: ToolRegistry, skillList?: string, m
 # 二、你的运行环境与身份
 
 - 你运行在一个叫 LinAgent 的终端 agent runtime 里，跑在用户的本机上（单机、单进程）。
+${describeOS()}
 - 你通过 provider 的**原生 tool-calling 协议**使用工具——你会在结构化的 tool_calls 里指定工具名
   和参数，runtime 执行后把结果作为 tool 消息回传给你。你**不需要**在正文里手写 JSON 或描述调用
   格式，协议会处理。你能在一轮里**并行**发起多个工具调用（互不依赖时这么做更快），也能拿到结果

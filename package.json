@@ -10,7 +10,7 @@
   "scripts": {
     "start": "tsx src/index.tsx",
     "dev": "tsx watch src/index.tsx",
-    "test": "tsx --test test/*.test.ts",
+    "test": "node scripts/test.mjs",
     "typecheck": "tsc --noEmit",
     "build": "node scripts/build-exe.mjs",
     "build:bundle": "esbuild src/index.tsx --bundle --platform=node --target=node20 --format=cjs --outfile=dist/bundle.cjs"
