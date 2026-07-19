@@ -23,7 +23,10 @@ import type { ArchiveStore } from './archive.ts';
 import type { Ledger, LedgerItem, Preset } from './types.ts';
 import { shouldCompress, pickTailStartIndex, estimateTextTokens, type CompressionTriggerConfig } from './trigger.ts';
 import { estimateTokensOfMessage } from '../tokens.ts';
-import { resolveClass, compressionPolicyFor, disposeOf, type ConversationClass, type CompressionPolicy } from './class-policy.ts';
+import {
+  emergentClass, compressionPolicyFor, disposeOf,
+  type ConversationClass, type CompressionPolicy,
+} from './class-policy.ts';
 
 export interface CompressionInput {
   session_id: string;
@@ -41,6 +44,11 @@ export interface CompressionInput {
    * 注意仍要求"保头和保尾之间有可归档的中段"——history 太短时依然 no-op。
    */
   force?: boolean;
+  /**
+   * Phase 2 反馈偏置：kind → Δ，喂给 emergentClass 里结构涌现的 valueOf 聚合
+   * （越被召回的 kind 越易主导形状 → 越易决定类别 → 影响处置）。
+   */
+  bias?: Partial<Record<import('./primitive.ts').PrimitiveKind, number>>;
 }
 
 export interface CompressionOutput {
@@ -165,7 +173,9 @@ function isCompressionSummary(m: Message): boolean {
 export function tryCompress(input: CompressionInput): CompressionOutput {
   const extraTokens = estimateTextTokens(input.extraSystemText);
   const trigger = shouldCompress(input.history, extraTokens, input.cfg);
-  const cls = resolveClass(input.ledger, input.presets);
+  // 主线：类别从结构涌现（emergentClass 结构为主、关键词冷启动兜底），驱动 PROFILES 处置表。
+  // bias 是 Phase 2 反馈偏置，进结构涌现的估值聚合（越被召回的 kind 越易主导形状）。
+  const cls = emergentClass(input.ledger, input.bias, input.presets);
   const policy = compressionPolicyFor(cls);
 
   const noop = (): CompressionOutput => ({

@@ -38,6 +38,16 @@ export interface McpServerView {
   toolNames: string[];
 }
 
+/** /tools 列表里的一行：工具名 + 描述 + 是否需审批 + 参数名（必填带 *）。 */
+export interface ToolRowView {
+  name: string;
+  description: string;
+  /** 是否为高影响工具（调用时走审批门）。 */
+  risky: boolean;
+  /** 参数名列表；必填参数以 `*` 结尾。 */
+  params: string[];
+}
+
 export interface WorkflowNodeView {
   id: string;
   role: string;
@@ -55,6 +65,8 @@ export type PanelData =
   | { type: 'sessions'; rows: SessionRowView[]; location: string }
   | { type: 'trace'; entries: TraceEntryView[] }
   | { type: 'mcp'; servers: McpServerView[] }
+  | { type: 'tools'; rows: ToolRowView[]; riskyCount: number }
+  | { type: 'toolShow'; name: string; description: string; risky: boolean; schema: string }
   | { type: 'consolidate'; before: number; after: number; candidates: number; added: number; updated: number; superseded: number }
   | { type: 'planResult'; goal: string; steps: { id: string; kind: string; detail: string }[]; llmCalls: number; elapsedMs: number }
   | { type: 'workflowResult'; goal: string; nodes: WorkflowNodeView[]; answer: string; ms: number }

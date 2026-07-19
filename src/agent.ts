@@ -14,7 +14,7 @@ import {
 } from './context.ts';
 import type { MemoryStore, UserMemory } from './memory.ts';
 import {
-  addManual, forget, retrieveForQuery, formatForPrompt,
+  addManual, forget, retrieveForQuery, formatForPrompt, recomputeTiers,
 } from './memory.ts';
 import type {
   LedgerStore, LedgerPatch, ArchiveStore, CompressionTriggerConfig, Preset,
@@ -28,10 +28,13 @@ import {
   compressTraceData,
   buildTriggerConfig,
   consolidateLedgerToMemory,
+  consolidateStable,
+  BACKSTOP_MIN_VALUE,
   pickPreset,
   updateLedgerTool,
 } from './ledger/index.ts';
 import type { Ledger } from './ledger/index.ts';
+import type { FeedbackController } from './ledger/index.ts';
 import type { BackgroundTaskManager } from './tasks/manager.ts';
 import { taskTools } from './tools/tasks.ts';
 // plan 模式：复用 plan 引擎纯函数（planner / verifier / executor / reflector）作为
@@ -148,6 +151,20 @@ export interface MemoryConfig {
    * memory 工具（用户显式 add/forget）和 recall_memory（召回）不受它影响。
    */
   disableIngest?: boolean;
+  /**
+   * 沉淀模式（M1）：
+   *   'incremental'（默认）—— 每轮末沉稳定的高价值原语 + 会话收尾兜底扫。
+   *                          漏标 wrapping 也不丢高价值信息。
+   *   'wrap'              —— 仅会话收尾（wrapping/closed）时一次性沉淀（M0 旧行为）。
+   */
+  consolidate?: 'incremental' | 'wrap';
+  /**
+   * 分层模式（M2）：
+   *   'dynamic'（默认）—— freeze 时按召回反馈升降级 tier（warm↔frozen↔dormant）+ frozen 容量控制。
+   *                      年轻/无召回历史的记忆下是 no-op，安全。
+   *   'static'        —— tier 恒为 layer 派生初值，不升降级（M1 及之前的行为）。
+   */
+  tiering?: 'dynamic' | 'static';
 }
 
 /**
@@ -173,6 +190,13 @@ export interface LedgerConfig {
    * 用户想加自己的 preset 就在 REPL 那层 mergePresets(userPresets) 传进来。
    */
   presets?: Preset[];
+  /**
+   * 反馈控制器（Phase 2）——压缩与记忆共享的负反馈环。传了则：
+   *   · 压缩/沉淀的 valueOf 读入它的 bias（越被召回的 kind 越易保留/沉淀）
+   *   · 类别从结构涌现时，bias 影响哪个 kind 主导形状
+   * recall 工具那侧的 record 在 runtime 装配时挂到同一个 controller 上。
+   */
+  feedback?: FeedbackController;
 }
 
 function makeMemoryHandle(store: MemoryStore, userId: string, sessionId: string): MemoryHandle {
@@ -592,34 +616,57 @@ export class Agent {
       session.history.push({ role: 'assistant', content: `[agent] ${finalAnswer}` });
     }
 
+    // 记忆写入 —— 账本沉淀为唯一自动写入路径（extractor 每轮抽取已废弃删除）。
+    //   M1 双路径（默认 incremental）：
+    //     · 增量：每轮末沉"稳定的高价值"原语（value≥hi 且存活≥N 轮），沉过打标记跳过。
+    //             漏标 wrapping 也不丢高价值信息 —— 治了"全有或全无"的老病。
+    //     · 兜底：会话收尾（wrapping/closed）时全扫 value≥lo，收走增量没够格的残余。
+    //   'wrap' 模式退化为 M0 旧行为（仅收尾一次性沉淀）。
+    //   另一条写入路径是用户显式的 memory 工具（add/forget），不在这里。
+    //   注意：增量会给账本条目打 meta.consolidated 标记，必须在账本落盘【之前】跑，标记才随盘持久。
+    const ledgerWraps = currentLedger?.core.state === 'wrapping'
+                     || currentLedger?.core.state === 'closed';
+    if (this.memory && !this.memory.disableIngest && userMem
+        && this.ledger && currentLedger) {
+      const mode = this.memory.consolidate ?? 'incremental';
+      const fbBias = this.ledger.feedback?.bias();  // Phase 2：反馈偏置进估值门
+      try {
+        let report;
+        if (mode === 'wrap') {
+          // 旧行为：仅收尾一次性沉淀（无估值门）。
+          if (ledgerWraps) report = consolidateLedgerToMemory(currentLedger, userMem, Date.now());
+        } else if (ledgerWraps) {
+          // 兜底扫：收尾时用 lo 阈值收走残余（会顺带处理增量已标记的——Jaccard 去重不重复入库）。
+          report = consolidateLedgerToMemory(currentLedger, userMem, Date.now(), {
+            minValue: BACKSTOP_MIN_VALUE, currentTurn: turn, bias: fbBias,
+          });
+        } else {
+          // 增量：每轮末沉稳定的高价值原语。
+          report = consolidateStable(currentLedger, userMem, turn, Date.now(), fbBias);
+        }
+        // 仅当真有新增/更新才落盘，省 IO（增量稳态下多数轮是 0 变化）。
+        if (report && (report.merge.added.length || report.merge.updated.length || report.merge.superseded.length)) {
+          this.memory.store.save(userMem);
+          push('memory', {
+            phase: mode === 'wrap' || ledgerWraps ? 'consolidate' : 'consolidate_incremental',
+            candidates: report.candidates,
+            added: report.merge.added.length,
+            updated: report.merge.updated.length,
+            superseded: report.merge.superseded.length,
+          }, turn);
+        }
+      } catch (err) {
+        push('error', { where: 'memory_consolidate', message: (err as Error).message }, turn);
+      }
+    }
+
     // 账本落盘。chat 结束时统一保存，不每轮 patch 都写盘（IO 摊薄）。
+    // 放在记忆沉淀【之后】：增量沉淀会给条目打 meta.consolidated，要随这次落盘持久。
     if (this.ledger && currentLedger) {
       try {
         this.ledger.store.save(currentLedger);
       } catch (err) {
         push('error', { where: 'ledger_save', message: (err as Error).message }, turn);
-      }
-    }
-
-    // 记忆写入 —— 账本沉淀为唯一自动写入路径（extractor 每轮抽取已废弃删除）：
-    //   会话被 LLM 标记为 wrapping/closed 时，把账本条目路由到 memory（consolidateLedgerToMemory）。
-    //   另一条写入路径是用户显式的 memory 工具（add/forget），不在这里。
-    const ledgerWraps = currentLedger?.core.state === 'wrapping'
-                     || currentLedger?.core.state === 'closed';
-    if (this.memory && !this.memory.disableIngest && userMem
-        && this.ledger && currentLedger && ledgerWraps) {
-      try {
-        const report = consolidateLedgerToMemory(currentLedger, userMem, Date.now());
-        this.memory.store.save(userMem);
-        push('memory', {
-          phase: 'consolidate',
-          candidates: report.candidates,
-          added: report.merge.added.length,
-          updated: report.merge.updated.length,
-          superseded: report.merge.superseded.length,
-        }, turn);
-      } catch (err) {
-        push('error', { where: 'memory_consolidate', message: (err as Error).message }, turn);
       }
     }
 
@@ -820,9 +867,19 @@ export class Agent {
     const skillList = this.skills?.describeForPrompt() || undefined;
     const base = buildSystemPrompt(this.registry, skillList, this.config.mcpResources);
 
-    // identity/preferences 快照：空 query 只取"每次都注入"的两层。
+    // identity/preferences 快照：空 query 只取"每次都注入"的两层（现按 tier==frozen 分区）。
     let memSnapshot = '';
     if (userMem) {
+      // M2：freeze 前按召回反馈重算 tier（缓存安全的唯一时点）。动态模式默认开。
+      // 年轻/无召回历史的记忆下 recomputeTiers 是 no-op；有变更才落盘（一会话一次，廉价）。
+      if ((this.memory?.tiering ?? 'dynamic') === 'dynamic') {
+        const delta = recomputeTiers(userMem);
+        const changed = delta.promoted + delta.demoted + delta.dormant + delta.evicted;
+        if (changed) {
+          try { this.memory!.store.save(userMem); } catch { /* 落盘失败不阻塞冻结 */ }
+          push('memory', { phase: 'retier', ...delta }, 0);
+        }
+      }
       memSnapshot = formatForPrompt(retrieveForQuery(userMem, '', 0));
       push('memory', { phase: 'freeze', snapshot: memSnapshot ? 'identity+preferences' : 'empty' }, 0);
     }
@@ -868,6 +925,7 @@ export class Agent {
         cfg,
         archive: this.ledger.archive,
         presets: this.ledger.presets,
+        bias: this.ledger.feedback?.bias(),
       });
       if (out.compressed) {
         session.history = out.history;
@@ -921,6 +979,7 @@ export class Agent {
       cfg,
       archive: this.ledger.archive,
       presets: this.ledger.presets,
+      bias: this.ledger.feedback?.bias(),
       force: true,
     });
     if (out.compressed) {

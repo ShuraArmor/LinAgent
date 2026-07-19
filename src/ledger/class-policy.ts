@@ -203,3 +203,90 @@ export function featureOf(m: Message): MessageFeature {
 export function disposeOf(m: Message, policy: CompressionPolicy): Disposition {
   return policy.dispose[featureOf(m)];
 }
+
+// ── Phase 1：结构化处置（从原语组合涌现，不查 preset 关键词）──────────────
+
+import { allItemArrays, kindOf, valueOf, type PrimitiveKind } from './primitive.ts';
+
+/** 结构涌现出的"形状"——不是固定类别，是原语价值组合的主导轴。 */
+export type LedgerShape = 'causal' | 'executional' | 'deliberative' | 'weak';
+
+/**
+ * 从账本的**原语价值组合**涌现形状（Phase 1 的核心，取代 preset 关键词匹配）。
+ *
+ * 与 resolveClass 的本质区别：resolveClass 靠 pickPreset 匹配 intent/命名空间的**关键词**
+ * ——哪怕账本里根本没填因果内容，标题带"debug"也会判成 debug。deriveClassFromStructure
+ * 只看**账本实际装了什么高价值原语**：
+ *   causal      —— cause/claim 的聚合价值主导（排错：证据/因果是命脉）
+ *   executional —— step/artifact 主导（执行：动作/产物是命脉）
+ *   deliberative—— choice/option 主导（风暴：决策/取舍是命脉）
+ *   weak        —— 没有明显主导（保守处置，等价 default）
+ *
+ * 聚合用 valueOf（含被引用/状态/新旧调制），所以"孤立死支路的 cause"不会把会话拽成 causal。
+ */
+export function deriveClassFromStructure(
+  ledger: Ledger | undefined,
+  bias?: Partial<Record<PrimitiveKind, number>>,
+): LedgerShape {
+  if (!ledger) return 'weak';
+  const weight: Record<'causal' | 'executional' | 'deliberative', number> = {
+    causal: 0, executional: 0, deliberative: 0,
+  };
+  const ctx = { ledger, currentTurn: ledger.turn_count, bias };
+  const axisOf: Partial<Record<PrimitiveKind, keyof typeof weight>> = {
+    cause: 'causal', claim: 'causal',
+    step: 'executional', artifact: 'executional',
+    choice: 'deliberative', option: 'deliberative',
+    // block/thread 不投票主导轴（它们在任何形状里都可能出现）。
+  };
+  for (const [path, items] of allItemArrays(ledger)) {
+    for (const it of items) {
+      const axis = axisOf[kindOf(path, it)];
+      if (axis) weight[axis] += valueOf(path, it, ctx);
+    }
+  }
+  const entries = Object.entries(weight) as Array<[keyof typeof weight, number]>;
+  entries.sort((a, b) => b[1] - a[1]);
+  const [topAxis, topVal] = entries[0];
+  const total = weight.causal + weight.executional + weight.deliberative;
+
+  // 主导判据用**份额**（占总质量的比例），不是原始差值之比。
+  // 原因：各 kind 的 base 悬殊（choice=0.85 vs step=0.45），用原始"topVal ≥ second×1.25"
+  // 会让一条顺带的 decision 几乎追平两条真正的 step → 混合会话动辄塌成 weak，主线失效；
+  // 同时单条高 base 原语又会以绝对量过关、把整场一锤定音。份额判据两头都治：
+  //   MIN_MASS  —— 总质量地板，约"多于一条显著原语"，挡住"单条就定性"和空/稀薄账本。
+  //   MIN_SHARE —— 主导轴须占多数（>0.5），挡住三轴纠缠时的过度自信。
+  const MIN_MASS = 1.0;
+  const MIN_SHARE = 0.5;
+  if (total < MIN_MASS || topVal / total < MIN_SHARE) return 'weak';
+  return topAxis === 'causal' ? 'causal'
+       : topAxis === 'executional' ? 'executional'
+       : 'deliberative';
+}
+
+/** 结构形状 → 已知类别标签。weak → default（保守）。 */
+export function classFromShape(shape: LedgerShape): ConversationClass {
+  return shape === 'causal' ? 'debug'
+       : shape === 'executional' ? 'execution'
+       : shape === 'deliberative' ? 'brainstorm'
+       : 'default';
+}
+
+/**
+ * **涌现类别**（主线：类型从结构涌现，是真实标签，驱动压缩处置 + 召回偏置）。
+ *
+ * 结构为主 —— deriveClassFromStructure 看账本实际装了什么高价值原语，涌现主导轴。
+ * 关键词为冷启动先验 —— 账本还稀薄（shape=weak，会话刚起没几条原语）时，退回
+ * resolveClass 用 intent/命名空间关键词兜个底。等原语攒够了，结构自然接管。
+ *
+ * 压缩与召回**共用这一个**函数 → 二者永远看同一个涌现类别，不再各算各的。
+ */
+export function emergentClass(
+  ledger: Ledger | undefined,
+  bias?: Partial<Record<PrimitiveKind, number>>,
+  presets?: Preset[],
+): ConversationClass {
+  const shape = deriveClassFromStructure(ledger, bias);
+  if (shape !== 'weak') return classFromShape(shape);   // 结构够明确 → 结构驱动
+  return ledger ? resolveClass(ledger, presets) : 'default';  // 冷启动 → 关键词先验
+}

@@ -15,9 +15,9 @@ import { buildRuntime } from './runtime.ts';
 import type { ApprovalRequest, ApprovalDecision } from './agent.ts';
 import { UIStore } from './ui/ink/store.ts';
 import { App } from './ui/ink/App.tsx';
-import { breakdown as tokenBreakdown, totalTokens, contextWindow, estimateTokensOfMessage } from './tokens.ts';
+import { breakdown as tokenBreakdown, breakdownWithSegments, totalTokens, contextWindow, estimateTokensOfMessage } from './tokens.ts';
 import { toolResultPreview, compressLine } from './ui/render.ts';
-import { renderLedgerForPrompt, analyzeEmergence, consolidateLedgerToMemory } from './ledger/index.ts';
+import { renderLedgerWithPrimitives, analyzeEmergence, consolidateLedgerToMemory } from './ledger/index.ts';
 import { orchestrate, verifyGraph, runWorkflow, GraphVerifyError } from './workflow/index.ts';
 import type { Session } from './session.ts';
 import type { Message } from './types.ts';
@@ -104,9 +104,18 @@ async function main() {
   for (const n of runtime.notices) store.push('system', n);
   store.push('system', '输入消息开始对话 · /help 看命令 · /exit 退出');
 
+  // 最近一轮的 system 段快照（system prompt 是每轮临时冻结/拼装的，不写进 history，
+  // 所以 token 统计必须从 RunResult 单独拿，否则 system 类别恒为 ~0、总量严重偏低）。
+  let lastSeg: { systemBase: string; memory: string; ledger: string } = {
+    systemBase: '', memory: '', ledger: '',
+  };
+
+  // 计算含 system 段的完整用量分解（system prompt 不在 history 里，须单独计入；
+  // 去重逻辑见 breakdownWithSegments）。
+  const computeBreakdown = () => breakdownWithSegments(current.history, lastSeg);
+
   const refreshTokens = () => {
-    const b = tokenBreakdown(current.history);
-    store.setStatus({ tokensUsed: totalTokens(b) });
+    store.setStatus({ tokensUsed: totalTokens(computeBreakdown()) });
   };
 
   // ── 处理锁 + 排队（保留原语义：chat 跑时输入进队列，结束按序 drain）──
@@ -169,6 +178,15 @@ async function main() {
       });
     }
     store.setStatus({ turn: res.turns });
+    // 捕获本轮 system 段快照，供 token 统计（system prompt 不在 history 里，见 computeBreakdown）。
+    // no-op 唤醒轮（turns===0）systemPromptBase 为空 —— 别用空串覆盖掉上一轮的有效快照。
+    if (res.turns > 0) {
+      lastSeg = {
+        systemBase: res.systemPromptBase ?? '',
+        memory: res.memoryPrompt ?? '',
+        ledger: res.ledgerPrompt ?? '',
+      };
+    }
     refreshTokens();
     sessions.save(current);
   };
@@ -273,7 +291,7 @@ async function main() {
         cleanupAndExit();
         return true;
       case 'help':
-        store.push('system', '命令: /new /list /switch /rm /plan /memory /skill /ledger /consolidate /emergence /mcp /workflow /tokens /compress /history /trace /reset /help /exit');
+        store.push('system', '命令: /new /list /switch /rm /plan /memory /skill /tools /ledger /consolidate /emergence /mcp /workflow /tokens /compress /history /trace /reset /help /exit');
         return true;
       case 'plan':
         current.state.planMode = !current.state.planMode;
@@ -354,7 +372,7 @@ async function main() {
       }
       case 'tokens':
       case 'token':
-        store.pushPanel({ type: 'tokens', breakdown: tokenBreakdown(current.history), ctxWindow: contextWindow() });
+        store.pushPanel({ type: 'tokens', breakdown: computeBreakdown(), ctxWindow: contextWindow() });
         return true;
       case 'history':
       case 'hist': {
@@ -425,7 +443,7 @@ async function main() {
         try {
           const l = ledgerStore.load(current.id, 'zh');
           store.pushPanel({
-            type: 'ledger', rendered: renderLedgerForPrompt(l),
+            type: 'ledger', rendered: renderLedgerWithPrimitives(l),
             turn: l.turn_count, preset: l.preset_used ?? '—',
             updated: new Date(l.updated_at).toLocaleString(),
           });
@@ -466,6 +484,36 @@ async function main() {
             toolNames: mcpManager.getServerTools(s.name).map((t) => t.name),
           })),
         });
+        return true;
+      }
+      case 'tools':
+      case 'tool': {
+        const all = registry.list();
+        const name = rest[0];
+        if (name) {
+          // /tools <name>：单个工具详情（完整描述 + 参数 schema）。
+          const t = all.find((x) => x.name === name);
+          if (!t) { store.push('error', `未找到工具: ${name}（用 /tools 看全部）`); return true; }
+          store.pushPanel({
+            type: 'toolShow',
+            name: t.name, description: t.description,
+            risky: workflowApprovalSet.has(t.name),
+            schema: JSON.stringify(t.parameters, null, 2),
+          });
+          return true;
+        }
+        // /tools：列出全部工具（名字 + 描述 + 审批标记 + 参数名，必填带 *）。
+        const rows = all.map((t) => {
+          const props = t.parameters?.properties ?? {};
+          const required = new Set(t.parameters?.required ?? []);
+          return {
+            name: t.name,
+            description: t.description,
+            risky: workflowApprovalSet.has(t.name),
+            params: Object.keys(props).map((p) => (required.has(p) ? `${p}*` : p)),
+          };
+        });
+        store.pushPanel({ type: 'tools', rows, riskyCount: rows.filter((r) => r.risky).length });
         return true;
       }
       case 'trace': {

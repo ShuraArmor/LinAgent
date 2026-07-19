@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   estimateTokensOfText, estimateTokensOfMessage,
-  categorize, breakdown, totalTokens, humanTokens,
+  categorize, breakdown, breakdownWithSegments, totalTokens, humanTokens,
 } from '../src/tokens.ts';
 import { tokenLine, tokenBarChart } from '../src/ui/tokens.ts';
 import type { Message } from '../src/types.ts';
@@ -115,4 +115,48 @@ test('tokens: extras.memory 计入 memory_facts 而不是 system', () => {
   );
   assert.ok(b.memory_facts > 0, 'memory 段应该算到 memory_facts');
   assert.equal(b.system, 0);
+});
+
+test('tokens: breakdownWithSegments 让 system 类别非零（修复 /tokens 系统段恒为 0 的 bug）', () => {
+  const history: Message[] = [
+    { role: 'user', content: '你好' },
+    { role: 'assistant', content: '你好，有什么可以帮你' },
+  ];
+  // 只对 history 做 breakdown → system 恒为 0（旧 bug）
+  const naive = breakdown(history);
+  assert.equal(naive.system, 0, '前提：history 里没有 system 段');
+  // 带上冻结的 system prompt → system 类别应显著非零
+  const withSeg = breakdownWithSegments(history, {
+    systemBase: 'You are LinAgent. 可用工具: fs_read, fs_write, bash_exec ...(很长的工具 schema)',
+    memory: '',
+    ledger: '',
+  });
+  assert.ok(withSeg.system > 0, '压缩前后 system 都不该是 0');
+  assert.ok(totalTokens(withSeg) > totalTokens(naive), '总量应比只数 history 大');
+});
+
+test('tokens: breakdownWithSegments 不双算内嵌于 systemBase 的 memory 段', () => {
+  const mem = '关于本用户的已知信息:\n- identity:\n    · 住在杭州';
+  const base = 'You are LinAgent. 工具 schema...';
+  // 模拟 freeze：systemBase 已内嵌 memory（[base, memSnapshot] 拼接）
+  const systemBase = [base, mem].join('\n\n');
+  const history: Message[] = [{ role: 'user', content: '嗨' }];
+
+  const b = breakdownWithSegments(history, { systemBase, memory: mem, ledger: '' });
+
+  // memory 应只在 memory_facts 里算一次
+  assert.ok(b.memory_facts > 0, 'memory 归入 memory_facts');
+  // system 段 = base（memory 已被剥离）。若发生双算，system 会包含 memory 的 token。
+  const baseOnly = breakdown(history, { systemBase: base });
+  assert.equal(b.system, baseOnly.system, 'system 段不应再含 memory（无双算）');
+});
+
+test('tokens: breakdownWithSegments 计入 ledger 段', () => {
+  const history: Message[] = [{ role: 'user', content: '嗨' }];
+  const noLedger = breakdownWithSegments(history, { systemBase: 'sys', memory: '', ledger: '' });
+  const withLedger = breakdownWithSegments(history, {
+    systemBase: 'sys', memory: '',
+    ledger: '【当前账本】\n- findings: 用户想查天气\n- decisions: 调用 weather 工具',
+  });
+  assert.ok(withLedger.system > noLedger.system, 'ledger 段应计入 system 类别');
 });

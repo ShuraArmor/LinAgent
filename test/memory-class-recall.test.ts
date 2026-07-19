@@ -6,7 +6,7 @@ import type { UserMemory, Fact } from '../src/memory.ts';
 function mkFact(id: string, text: string, cls?: string): Fact {
   return {
     id, layer: 'facts', text, confidence: 0.8,
-    created_at: 0, last_seen_at: 0,
+    created_at: 0, last_seen_at: 0, recall_count: 0,
     source: { session: 's', turn: 1, class: cls },
   };
 }

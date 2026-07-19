@@ -14,7 +14,7 @@
  */
 
 import type { Tool } from '../types.ts';
-import { retrieveForQuery, formatForPrompt } from '../memory.ts';
+import { retrieveForQuery, formatForPrompt, bumpRecall } from '../memory.ts';
 import type { MemoryStore, RecallReRankBias } from '../memory.ts';
 
 const DEFAULT_TOPK = 5;
@@ -27,6 +27,7 @@ export function buildRecallMemoryTool(
   store: MemoryStore,
   userId: string,
   resolveBias?: (sessionId: string | undefined) => RecallReRankBias | undefined,
+  onRecall?: (hitKinds: string[]) => void,
 ): Tool {
   return {
     name: 'recall_memory',
@@ -62,6 +63,18 @@ export function buildRecallMemoryTool(
       const hits = retrieveForQuery(mem, query, topK, bias).filter(
         (f) => f.layer === 'facts' || f.layer === 'ongoing',
       );
+      // M2 反馈：命中的 fact 累加 recall_count（负反馈信号，下次 freeze 据此升级 tier）。
+      // 实时落盘，跨会话累积；不动 tier 本身，故不碰当前会话的冻结快照。
+      if (hits.length) {
+        const bumped = bumpRecall(mem, hits.map((f) => f.id));
+        if (bumped) store.save(mem);
+        // Phase 2 反馈：把命中 fact 的原语 kind 报给控制器（负反馈环的误差信号）。
+        // kind 是 M0 沉淀时带上的；缺失的跳过（不硬派 claim，避免污染信号）。
+        if (onRecall) {
+          const kinds = hits.map((f) => f.kind).filter((k): k is string => typeof k === 'string' && k.length > 0);
+          if (kinds.length) onRecall(kinds);
+        }
+      }
       return {
         ok: true,
         query,

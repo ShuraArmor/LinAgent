@@ -23,6 +23,104 @@ import { join } from 'node:path';
 
 export type MemoryLayer = 'identity' | 'preferences' | 'facts' | 'ongoing';
 
+/**
+ * 显著性层（tier）—— 与 layer（语义桶）正交的一根轴，反馈驱动，**真正决定注入行为**。
+ *   frozen  注入冻结 system prompt（会话内稳定）
+ *   warm    recall_memory 按需召回
+ *   dormant 默认不注入不召回，只深召回可达（归档但不遗忘）
+ * 初值由 layer 派生（identity/preferences→frozen，facts/ongoing→warm），之后按 recall 反馈升降级。
+ * 详见 docs/design-primitive-compression.md 记忆重构章。
+ */
+export type MemoryTier = 'frozen' | 'warm' | 'dormant';
+
+/** layer → tier 初值。 */
+export function defaultTierFor(layer: MemoryLayer): MemoryTier {
+  return layer === 'identity' || layer === 'preferences' ? 'frozen' : 'warm';
+}
+
+/** 动态分层参数（M2）——手调初值，靠实测磨。 */
+export interface TieringConfig {
+  /** warm→frozen 升级门槛：累计召回次数 ≥ 此值。 */
+  promoteAtRecalls: number;
+  /** frozen→warm 降级：距上次召回（或创建）超过此毫秒数且非用户断言。 */
+  demoteAfterMs: number;
+  /** warm→dormant 降级：距上次接触超过此毫秒数且 confidence 低于 dormantMaxConf。 */
+  dormantAfterMs: number;
+  dormantMaxConf: number;
+  /** frozen 层容量上限（防冻结 prompt 膨胀）；超了把最低分的逐回 warm。 */
+  frozenCap: number;
+}
+
+export const DEFAULT_TIERING: TieringConfig = {
+  promoteAtRecalls: 3,
+  demoteAfterMs: 30 * 24 * 3600 * 1000,   // 30 天没被召回的 frozen 降 warm
+  dormantAfterMs: 90 * 24 * 3600 * 1000,  // 90 天没接触的 warm 降 dormant
+  dormantMaxConf: 0.75,
+  frozenCap: 24,
+};
+
+/**
+ * frozen 池里一条 fact 的"保留分"——决定 frozenCap 超限时谁被逐回 warm。
+ * 用户断言的（identity 类）几乎不可动（+1000）；其余按召回次数 + confidence。
+ */
+function frozenScore(f: Fact): number {
+  const asserted = f.tags?.includes('user_asserted') ? 1000 : 0;
+  return asserted + (f.recall_count ?? 0) * 2 + f.confidence;
+}
+
+/**
+ * 重算所有 fact 的 tier（M2 核心）——**只在会话启动 freeze 时调用**。
+ *
+ * 为什么只在 freeze 时：freezeSystemPrompt 把 frozen 层快照进 system 后整会话复用以保
+ * provider 前缀缓存。tier 若在会话中途变，注入内容就变、每轮破缓存。所以升降级一律
+ * 推迟到下次 freeze 统一算——会话内 recall_count 照常累加，但 tier 不动。
+ *
+ * 规则：
+ *   warm  → frozen ：recall_count ≥ promoteAtRecalls（被反复召回 = 显著性被低估）
+ *   frozen→ warm   ：非用户断言 且 距上次召回 > demoteAfterMs（冷了，别占冻结预算）
+ *   warm  → dormant：距上次接触 > dormantAfterMs 且 confidence < dormantMaxConf（几乎死了）
+ *   frozen 超 frozenCap：按 frozenScore 逐回 warm，直到不超（负反馈稳态）
+ *
+ * 就地改 mem.facts 的 tier；返回变更计数（供 trace / 落盘判断）。
+ */
+export function recomputeTiers(
+  mem: UserMemory,
+  now: number = Date.now(),
+  cfg: TieringConfig = DEFAULT_TIERING,
+): { promoted: number; demoted: number; dormant: number; evicted: number } {
+  let promoted = 0, demoted = 0, dormant = 0, evicted = 0;
+  const alive = mem.facts.filter((f) => !f.superseded_by);
+
+  for (const f of alive) {
+    if (!f.tier) f.tier = defaultTierFor(f.layer);
+    const lastTouch = f.last_recalled_at ?? f.last_seen_at ?? f.created_at;
+    const asserted = f.tags?.includes('user_asserted');
+
+    if (f.tier === 'warm') {
+      if ((f.recall_count ?? 0) >= cfg.promoteAtRecalls) { f.tier = 'frozen'; promoted++; }
+      else if (now - lastTouch > cfg.dormantAfterMs && f.confidence < cfg.dormantMaxConf) {
+        f.tier = 'dormant'; dormant++;
+      }
+    } else if (f.tier === 'frozen') {
+      // 用户断言的身份/偏好不因"冷"降级（它们本就稳定、不靠召回证明价值）。
+      if (!asserted && now - lastTouch > cfg.demoteAfterMs) { f.tier = 'warm'; demoted++; }
+    } else if (f.tier === 'dormant') {
+      // 沉睡的被再次召回（recall_count 涨了）→ 复活回 warm。
+      if ((f.recall_count ?? 0) >= 1 && now - lastTouch < cfg.dormantAfterMs) { f.tier = 'warm'; }
+    }
+  }
+
+  // frozen 容量控制器：超上限就把最低分的逐回 warm（稳态负反馈，防冻结 prompt 膨胀）。
+  let frozen = alive.filter((f) => f.tier === 'frozen');
+  if (frozen.length > cfg.frozenCap) {
+    frozen.sort((a, b) => frozenScore(a) - frozenScore(b)); // 低分在前
+    const overflow = frozen.length - cfg.frozenCap;
+    for (let i = 0; i < overflow; i++) { frozen[i].tier = 'warm'; evicted++; }
+  }
+
+  return { promoted, demoted, dormant, evicted };
+}
+
 export interface Fact {
   id: string;
   layer: MemoryLayer;
@@ -33,6 +131,14 @@ export interface Fact {
   source: { session: string; turn: number; class?: string };
   superseded_by?: string;     // 若被替代，指向那条新 fact 的 id
   tags?: string[];            // 可选：粗粒度类别标签，由抽取器填
+  /** 从账本原语带过来的语义角色（claim/choice/cause/...）。仅 consolidation 来源的 fact 有。 */
+  kind?: string;
+  /** 显著性层。缺省时按 layer 派生（见 defaultTierFor）。 */
+  tier?: MemoryTier;
+  /** 被 recall_memory 命中的累计次数（负反馈信号，freeze 时据此升降级）。 */
+  recall_count: number;
+  /** 最近一次被召回命中的时间戳。 */
+  last_recalled_at?: number;
 }
 
 export interface UserMemory {
@@ -63,11 +169,61 @@ const STOP = new Set([
 ]);
 
 /**
- * 分词器：产出两类 token
- *   - ≥2 字符的拉丁/数字段（转小写、整段作为一个 token）
- *   - 单个 CJK 字符（一个字一个 token）
- * 这样"machine learning"和"机器学习"都能得到有意义的重叠计算，
- * 且不需要引入分词库。对短用户事实的去重/检索来说粗但够用。
+ * 别名 / 同义词表（M3）—— 把不同写法收敛到同一个规范 token。
+ * 每组第一个是规范形；组内任何词（含规范形自己）出现时，都**额外**加一个 `~规范形` token
+ * （不替换原 token，故精确匹配仍占优、召回精度不掉）。
+ *
+ * 诚实边界：这里只做**形态归一 + 精确同义**（缩写、中英对照、包管理器家族）。
+ * 不做开放域上位词/语义泛化（那需要词向量，非本层目标）。可 growable：往下加组即可。
+ * CJK 短语（如"配置"）在分词前先做整串子串匹配（见 tokenize 的 phrase 段）。
+ */
+const ALIAS_GROUPS: string[][] = [
+  ['config', 'configuration', 'configure', 'cfg', '配置', '设置'],
+  ['init', 'initialize', 'initialization', 'initialise', 'initializing', '初始化'],
+  ['pkgmgr', 'pnpm', 'npm', 'yarn', 'bun', '包管理器', '包管理'],
+  ['dependency', 'dependencies', 'dep', 'deps', '依赖'],
+  ['database', 'db', '数据库'],
+  ['delete', 'remove', 'del', 'rm', '删除', '移除'],
+  ['directory', 'dir', 'folder', '目录', '文件夹'],
+  ['repository', 'repo', '仓库'],
+  ['environment', 'env', '环境'],
+];
+
+/** token → 规范形（不含前缀）。CJK 短语单列，需整串匹配。 */
+const ALIAS_TOKEN = new Map<string, string>();
+const ALIAS_PHRASES: Array<[string, string]> = []; // [CJK短语, 规范形]
+for (const group of ALIAS_GROUPS) {
+  const canon = group[0];
+  for (const w of group) {
+    if (/\p{Script=Han}/u.test(w)) ALIAS_PHRASES.push([w, canon]);
+    else ALIAS_TOKEN.set(w, canon);
+  }
+}
+
+/**
+ * 轻词干：剥常见英文屈折后缀，让 deploy/deploying/deployed 落到同一 token。
+ * 保守——只砍高频规则后缀，砍完至少留 3 字符；处理砍 -ing/-ed 后的辅音重复（running→run）。
+ * 不做 Porter 全套（过度词干会把 university→univers 之类切错，得不偿失）。
+ */
+function stem(w: string): string {
+  let s = w;
+  if (s.length > 5 && s.endsWith('ing')) s = s.slice(0, -3);
+  else if (s.length > 4 && s.endsWith('ed')) s = s.slice(0, -2);
+  else if (s.length > 4 && s.endsWith('ies')) s = s.slice(0, -3) + 'y';
+  else if (s.length > 4 && (s.endsWith('es'))) s = s.slice(0, -2);
+  else if (s.length > 3 && s.endsWith('s') && !s.endsWith('ss')) s = s.slice(0, -1);
+  // 砍后缀造成的辅音重复：runn→run、stopp→stop。
+  if (s.length >= 3 && /([bcdfghjklmnpqrstvwxz])\1$/.test(s)) s = s.slice(0, -1);
+  return s.length >= 3 ? s : w; // 太短就退回原词，避免过度词干
+}
+
+/**
+ * 分词器：产出（原 token）+（词干 token）+（别名规范 token）。
+ *   - ≥2 字符的拉丁/数字段：转小写；加原词；加 `~词干`（英文）；命中别名再加 `~规范形`
+ *   - 单个 CJK 字符：一个字一个 token
+ *   - CJK 别名短语（如"配置"）：整串子串命中 → 额外加 `~规范形`
+ * 原 token 始终保留，故精确重叠不被稀释；扩展 token 只增召回、不降精度。
+ * 对短用户事实的去重/检索来说粗但够用，且零依赖。
  */
 function tokenize(s: string): Set<string> {
   const out = new Set<string>();
@@ -76,11 +232,23 @@ function tokenize(s: string): Set<string> {
   for (const raw of lower.split(/[^a-z0-9]+/)) {
     if (!raw || raw.length < 2 || STOP.has(raw)) continue;
     out.add(raw);
+    // 别名规范形（缩写/同义）——命中就加，用 ~ 前缀避免和真实词碰撞。
+    const canon = ALIAS_TOKEN.get(raw);
+    if (canon) out.add(`~${canon}`);
+    // 轻词干（仅英文字母段）——deploy/deploying/deployed 收敛。
+    if (/^[a-z]+$/.test(raw)) {
+      const st = stem(raw);
+      if (st !== raw) out.add(`~${st}`);
+    }
   }
   // CJK 单字，一个字一个 token
   const cjk = /\p{Script=Han}/gu;
   for (const m of lower.matchAll(cjk)) {
     if (!STOP.has(m[0])) out.add(m[0]);
+  }
+  // CJK 别名短语：整串子串匹配（"配置"→ ~config）。
+  for (const [phrase, canon] of ALIAS_PHRASES) {
+    if (lower.includes(phrase)) out.add(`~${canon}`);
   }
   return out;
 }
@@ -105,9 +273,12 @@ export function retrieveForQuery(
   topK = 5,
   bias?: RecallReRankBias,
 ): Fact[] {
+  // 按 tier 分区（M2）：frozen→永远注入、warm→按 query 召回、dormant→默认不可达。
+  // 静态模式下 tier 恒为 layer 派生初值（id/pref→frozen、facts/ongoing→warm、无 dormant），
+  // 故与旧的"按 layer 分区"结果完全一致；动态模式下则反映升降级后的真实显著性。
   const alive = mem.facts.filter((f) => !f.superseded_by);
-  const always = alive.filter((f) => f.layer === 'identity' || f.layer === 'preferences');
-  const searchable = alive.filter((f) => f.layer === 'facts' || f.layer === 'ongoing');
+  const always = alive.filter((f) => (f.tier ?? defaultTierFor(f.layer)) === 'frozen');
+  const searchable = alive.filter((f) => (f.tier ?? defaultTierFor(f.layer)) === 'warm');
   const qTokens = tokenize(query);
   const boostTokens = bias?.boostKeywords?.length ? tokenize(bias.boostKeywords.join(' ')) : new Set<string>();
   const preferLayers = new Set(bias?.preferLayers ?? []);
@@ -132,6 +303,26 @@ export function retrieveForQuery(
     .map((r) => r.f);
   // 永远注入的放前面，让模型先看到稳定信息。
   return [...always, ...scored];
+}
+
+/**
+ * 召回反馈（M2）—— 被 recall_memory 命中的 fact 累加 recall_count、刷新 last_recalled_at。
+ * 这是负反馈环的**误差信号**：被反复召回 = 显著性被低估，下次 freeze 该升级。
+ * 会话内实时累加不影响任何冻结快照（tier 本身不在这里动，只在 freeze 时重算）。
+ * 返回被更新的 fact 数（调用方据此决定要不要落盘）。
+ */
+export function bumpRecall(mem: UserMemory, ids: string[], now: number = Date.now()): number {
+  if (!ids.length) return 0;
+  const idSet = new Set(ids);
+  let n = 0;
+  for (const f of mem.facts) {
+    if (idSet.has(f.id)) {
+      f.recall_count = (f.recall_count ?? 0) + 1;
+      f.last_recalled_at = now;
+      n += 1;
+    }
+  }
+  return n;
 }
 
 /** 序列化为一段可注入到 system prompt 的文本（每条 fact 一个 bullet）。 */
@@ -162,6 +353,10 @@ export interface FactCandidate {
   tags?: string[];
   /** Free-text hint — extractor's guess at what this replaces. Similarity check is authoritative. */
   contradicts?: string;
+  /** 账本原语角色，consolidation 时由 kindOf 带上。 */
+  kind?: string;
+  /** 该原语的相对估值 ∈ [0,1]，consolidation 时由 valueOf 算出。M1 用作沉淀门槛。 */
+  value?: number;
 }
 
 export interface MergeReport {
@@ -228,6 +423,9 @@ export function mergeCandidates(
       last_seen_at: now,
       source,
       tags: cand.tags,
+      kind: cand.kind,
+      tier: defaultTierFor(cand.layer),
+      recall_count: 0,
     };
     mem.facts.push(newFact);
     report.added.push(newFact);
@@ -264,6 +462,8 @@ export function addManual(
     created_at: now, last_seen_at: now,
     source,
     tags: ['user_asserted'],
+    tier: defaultTierFor(layer),
+    recall_count: 0,
   };
   mem.facts.push(f);
   return f;
@@ -277,6 +477,20 @@ export interface MemoryStore {
   save(mem: UserMemory): void;
 }
 
+/**
+ * 归一化：给旧记忆记录补齐 M0 新字段（就地修改并返回）。
+ *   - 缺 recall_count → 0
+ *   - 缺 tier → 按 layer 派生（defaultTierFor）
+ * 旧 JSON 文件（无这些字段）因此照常加载，不丢数据、不报错。
+ */
+export function normalizeMemory(mem: UserMemory): UserMemory {
+  for (const f of mem.facts) {
+    if (typeof f.recall_count !== 'number') f.recall_count = 0;
+    if (!f.tier) f.tier = defaultTierFor(f.layer);
+  }
+  return mem;
+}
+
 /** 纯内存版 store —— 不落盘，仅供测试使用。 */
 export class MemoryMemoryStore implements MemoryStore {
   readonly location = '<memory>';
@@ -284,7 +498,7 @@ export class MemoryMemoryStore implements MemoryStore {
   load(userId: string): UserMemory {
     let m = this.data.get(userId);
     if (!m) { m = { userId, facts: [], next_id: 1 }; this.data.set(userId, m); }
-    return m;
+    return normalizeMemory(m);
   }
   save(mem: UserMemory): void { this.data.set(mem.userId, mem); }
 }
@@ -303,7 +517,7 @@ export class FileMemoryStore implements MemoryStore {
       if (typeof parsed.next_id !== 'number') {
         parsed.next_id = Math.max(0, ...parsed.facts.map((f) => Number(f.id.slice(1)) || 0)) + 1;
       }
-      return parsed;
+      return normalizeMemory(parsed);
     } catch {
       return { userId, facts: [], next_id: 1 };
     }

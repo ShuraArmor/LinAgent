@@ -85,6 +85,13 @@ export function ledgersDir(): string {
   return dir;
 }
 
+/** 反馈快照目录（Phase 2 慢环持久）：<home>/feedback/<userId>.json。 */
+export function feedbackDir(): string {
+  const dir = join(linagentHome().path, 'feedback');
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 export function tasksDir(): string {
   const dir = join(linagentHome().path, 'tasks');
   mkdirSync(dir, { recursive: true });

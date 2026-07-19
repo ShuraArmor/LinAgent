@@ -112,6 +112,38 @@ export function breakdown(
   return out;
 }
 
+/**
+ * 会话真实用量分解 —— 把「不在 history 里、但每轮真发出去」的 system 段一并计入。
+ *
+ * system prompt 是每轮临时冻结/拼装的（工具 schema + 角色约束 + 记忆快照 + 账本），
+ * 设计上不写回 history，所以直接对 history 做 breakdown 会让 system 类别恒为 ~0、
+ * 总量严重偏低。这里从一轮 RunResult 拿到那几段，正确归类。
+ *
+ * 关键去重：freeze 后的 `systemBase` 里**已内嵌** memory 快照
+ * （freeze = [base, memSnapshot, ledgerSeg]）。若把 memory 再单独计一次会双算，
+ * 故先从 systemBase 里剥掉 memory 段，再把 memory 归到 memory_facts。
+ *
+ * @param seg.systemBase 冻结后的整段 system prompt（含内嵌 memory）
+ * @param seg.memory     本轮记忆注入段（identity/preferences 快照）
+ * @param seg.ledger     本轮账本渲染段（每轮作为末尾 system 消息注入，不在 history）
+ */
+export function breakdownWithSegments(
+  history: Message[],
+  seg: { systemBase?: string; memory?: string; ledger?: string },
+): CategoryBreakdown {
+  const memory = seg.memory ?? '';
+  const systemBase = seg.systemBase ?? '';
+  // 从 systemBase 剥离已内嵌的 memory 段，避免与下面 extras.memory 双算。
+  const sysNoMem = memory && systemBase.includes(memory)
+    ? systemBase.replace(memory, '')
+    : systemBase;
+  const systemForCount = [sysNoMem, seg.ledger ?? ''].filter((s) => s.length).join('\n\n');
+  return breakdown(history, {
+    systemBase: systemForCount || undefined,
+    memory: memory || undefined,
+  });
+}
+
 /** 总 token 数。 */
 export function totalTokens(b: CategoryBreakdown): number {
   return b.system + b.user + b.assistant + b.tool_result + b.summary + b.memory_facts;

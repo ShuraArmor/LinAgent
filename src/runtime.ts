@@ -5,7 +5,7 @@
  * UI 耦合的部分（审批弹窗、workflow 面板）通过参数注入：调用方（UI 层）提供 approve
  * 回调和 workflow observer，runtime 只负责把它们接到 agent / run_workflow 工具上。
  */
-import { linagentHome, sessionsDir, memoryDir, skillsDir, ledgersDir, tasksDir } from './storage.ts';
+import { linagentHome, sessionsDir, memoryDir, skillsDir, ledgersDir, tasksDir, feedbackDir } from './storage.ts';
 import { join as pathJoin } from 'node:path';
 import { existsSync, readdirSync, renameSync } from 'node:fs';
 import { Agent, DEFAULT_AGENT_CONFIG } from './agent.ts';
@@ -21,8 +21,8 @@ import { FileMemoryStore } from './memory.ts';
 import type { MemoryStore } from './memory.ts';
 import { SkillRegistry } from './skills.ts';
 import { setSandboxRoot } from './tools/fs.ts';
-import { FileLedgerStore, FileArchiveStore, resolveClass, recallBiasFor } from './ledger/index.ts';
-import type { LedgerStore, ArchiveStore } from './ledger/index.ts';
+import { FileLedgerStore, FileArchiveStore, emergentClass, recallBiasFor, FeedbackController, FileFeedbackStore } from './ledger/index.ts';
+import type { LedgerStore, ArchiveStore, Preset } from './ledger/index.ts';
 import { buildRecallArchiveTool } from './tools/recall.ts';
 import { buildRecallMemoryTool } from './tools/recall-memory.ts';
 import { BackgroundTaskManager } from './tasks/manager.ts';
@@ -130,19 +130,29 @@ export async function buildRuntime(config: CliConfig, hooks: RuntimeHooks): Prom
   // ─── 账本 / 归档 / 后台任务 ───
   const ledgerStore = new FileLedgerStore(ledgersDir());
   const archiveStore = new FileArchiveStore(pathJoin(home.path, 'archives'));
+  // Phase 2 反馈控制器：压缩与记忆共享的负反馈环。冷启动读慢环先验；recall 侧 record、
+  // 压缩/沉淀侧 bias 都挂到同一个 controller（同一内存态引用，快环即时共享）。
+  const feedback = new FeedbackController(new FileFeedbackStore(feedbackDir()), userId);
   registry.register(buildRecallArchiveTool(archiveStore));
   // recall_memory：按需召回 facts/ongoing（identity/preferences 已在冻结 system 里，不用查）。
-  // 召回偏置与压缩走同一根 ConversationClass 轴：按当前会话账本涌现类别，给同类别记忆加权。
+  // 召回偏置与压缩共用**同一个 emergentClass**：类别从账本结构涌现（原语价值组合，非关键词），
+  // 且喂入同一个反馈 bias。这样召回和压缩永远看同一个涌现类别，不再各算各的。
+  //
+  // presets 必须与 Agent 侧 LedgerConfig.presets 同源，否则冷启动（账本稀薄=weak）时压缩和召回
+  // 会退回**不同**关键词先验、解出不同类别，违反"同一根轴"。当前 runtime 不配自定义 presets
+  // （两侧都退回 BUILTIN，天然一致）；此处显式传同一个 ledgerPresets 引用，杜绝将来加了 presets
+  // 却只配到一侧的潜伏分叉。
+  const ledgerPresets: Preset[] | undefined = undefined;
   registry.register(buildRecallMemoryTool(memStore, userId, (sessionId) => {
     if (!sessionId) return undefined;
     try {
       const ledger = ledgerStore.load(sessionId, 'zh');
-      const cls = resolveClass(ledger);
+      const cls = emergentClass(ledger, feedback.bias(), ledgerPresets);
       return { class: cls, ...recallBiasFor(cls) };
     } catch {
       return undefined; // 账本加载失败 → 无偏置，退化为纯 Jaccard 召回
     }
-  }));
+  }, (hitKinds) => feedback.record(hitKinds as import('./ledger/index.ts').PrimitiveKind[])));
 
   const taskStore = new FileTaskStore(tasksDir());
   const taskManager = new BackgroundTaskManager(
@@ -176,6 +186,8 @@ export async function buildRuntime(config: CliConfig, hooks: RuntimeHooks): Prom
     store: ledgerStore,
     archive: archiveStore,
     language: 'zh',
+    presets: ledgerPresets,   // 与 recall 闭包同源（见上），保证冷启动两侧解出同一类别
+    feedback,
   }, taskManager);
 
   return {

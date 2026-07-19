@@ -80,7 +80,7 @@ test('memory e2e: 用户 "忘掉X" 走 memory 工具 → fact 变 stale', async 
   const s = store.load('default');
   s.facts.push({
     id: 'f1', layer: 'facts', text: '喜欢橘猫', confidence: 1,
-    created_at: 0, last_seen_at: 0, source: { session: 'x', turn: 0 },
+    created_at: 0, last_seen_at: 0, recall_count: 0, source: { session: 'x', turn: 0 },
   });
   s.next_id = 2;
   store.save(s);

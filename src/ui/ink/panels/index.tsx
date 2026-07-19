@@ -6,6 +6,7 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import type { PanelData, WorkflowNodeView, MemoryFactView } from './types.ts';
 import { humanTokens, totalTokens } from '../../../tokens.ts';
+import { toolTheme } from '../theme.ts';
 
 const LAYER_LABEL: Record<string, string> = {
   identity: 'identity（身份）', preferences: 'preferences（偏好）',
@@ -143,6 +144,50 @@ function McpPanel({ servers }: { servers: (PanelData & { type: 'mcp' })['servers
   );
 }
 
+function ToolsPanel({ rows, riskyCount }: { rows: (PanelData & { type: 'tools' })['rows']; riskyCount: number }) {
+  if (!rows.length) return <Text dimColor>（没有已注册的工具）</Text>;
+  // 工具名按最长对齐，描述整齐排开。
+  const nameW = Math.min(20, Math.max(...rows.map((r) => r.name.length)));
+  return (
+    <Box flexDirection="column">
+      <Text color="cyan" bold>工具  <Text dimColor>共 {rows.length} 个{riskyCount ? ` · ${riskyCount} 个需审批 ⚠` : ''}</Text></Text>
+      {rows.map((r) => {
+        const t = toolTheme(r.name);
+        return (
+          <Box key={r.name} flexDirection="column">
+            <Text>
+              {'  '}<Text color={t.color}>{t.icon} {r.name.padEnd(nameW)}</Text>
+              {r.risky ? <Text color="yellow"> ⚠</Text> : <Text>{'  '}</Text>}
+              {'  '}<Text dimColor>{r.description}</Text>
+            </Text>
+            {r.params.length > 0 && (
+              <Text dimColor>{'      '}参数: {r.params.join(', ')}</Text>
+            )}
+          </Box>
+        );
+      })}
+      <Text dimColor>{'  '}⚠ = 调用时走审批门 · 参数带 * 为必填 · /tools &lt;名字&gt; 看详情</Text>
+    </Box>
+  );
+}
+
+function ToolShowPanel({ d }: { d: PanelData & { type: 'toolShow' } }) {
+  const t = toolTheme(d.name);
+  return (
+    <Box flexDirection="column">
+      <Text>
+        <Text color={t.color} bold>{t.icon} {d.name}</Text>
+        {d.risky ? <Text color="yellow"> ⚠ 需审批</Text> : null}
+      </Text>
+      <Text>{'  '}{d.description}</Text>
+      <Box marginTop={1} flexDirection="column">
+        <Text color="cyan">参数 schema:</Text>
+        <Text dimColor>{d.schema}</Text>
+      </Box>
+    </Box>
+  );
+}
+
 function LedgerPanel({ d }: { d: PanelData & { type: 'ledger' } }) {
   if (!d.rendered) return <Text dimColor>（账本还是空的 — 让 agent 跑几轮就有内容了）</Text>;
   return (
@@ -231,6 +276,8 @@ export function Panel({ data }: { data: PanelData }) {
     case 'trace': return <TracePanel entries={data.entries} />;
     case 'history': return <HistoryPanel {...data} />;
     case 'mcp': return <McpPanel servers={data.servers} />;
+    case 'tools': return <ToolsPanel rows={data.rows} riskyCount={data.riskyCount} />;
+    case 'toolShow': return <ToolShowPanel d={data} />;
     case 'consolidate': return <ConsolidatePanel d={data} />;
     case 'planResult': return <PlanResultPanel d={data} />;
     case 'workflowResult': return <WorkflowResultPanel d={data} />;

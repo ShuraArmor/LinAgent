@@ -88,7 +88,9 @@ npm run build          # → dist/linagent.exe（Windows；其它平台无扩展
 - `/memory [list|forget <id>|clear]` — 查看/编辑记忆
 - `/trace` — 打印执行 trace
 
-技能 / 工作流 / MCP：`/skill [list|show <name>]` `/workflow <任务>` `/mcp`
+工具 / 技能 / 工作流 / MCP：
+- `/tools [<名字>]` — 列出所有已注册工具（名字 + 描述 + 参数 + 审批标记）；带名字看单个工具的完整 schema
+- `/skill [list|show <name>]` `/workflow <任务>` `/mcp`
 
 其它：`/help` `/exit`；处理中按 **Esc 打断**。
 
